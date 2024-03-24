@@ -1,6 +1,6 @@
 import enum
 import sys
-from typing import Any
+from typing import Any, List
 from collections.abc import Callable
 from collections.abc import Hashable
 from types import ModuleType
@@ -211,6 +211,7 @@ class OperatorExecutor(Executor):
         bind_postprocess: None | Callable = None,
         replaces: None | Callable = None,
         python_printer: Callable = default_python_printer,
+        tags: None | list[Any] = None,
     ) -> Symbol:
         assert (like is None) ^ (meta is None), "Expected one and only one of 'like' and 'meta' to be specified"
         assert (module is not None) + (
@@ -236,6 +237,7 @@ class OperatorExecutor(Executor):
             executor=self,
             _bind_postprocess=_bind_postprocess,
             python_printer=python_printer,
+            tags=tags,
         )
         self.opmap[name] = sym
 
