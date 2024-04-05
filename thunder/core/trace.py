@@ -88,6 +88,7 @@ class TraceCtx:
         self._complete = False
 
         self._any_future_tensors = False
+        self._add_breakpoint = False
 
     @property
     def prologue(self):
@@ -382,6 +383,9 @@ class TraceCtx:
             # Separates constants from operations
             # if len(constants) > 0:
             #     program.append("")
+
+            if self._add_breakpoint:
+                program.append(f"{codeutils.indent_string(1)}breakpoint()")
 
             # Prints operations
             for bsym in self.bound_symbols:

@@ -58,6 +58,7 @@ from thunder.core.proxies import (
     DictProxy,
     AnyProxy,
 )
+from thunder.core.utils import debug_traces_ctx, DebugTraceFlags
 from thunder.core.jit_ext import thunder_general_jit
 from thunder.executors.torch_autograd import split_forward_backward, ThunderFunction
 from thunder.cudagraphs import CUDAGraphExecutor
@@ -371,6 +372,9 @@ def jit(
         compile_options=compile_options,
         executor_lookasides=executor_lookasides,
     )
+
+    # Hack
+    cd.debug_traces_ctx = debug_traces_ctx.get()
     cs = CompileStats()
 
     @_with_cache_info_ctx
@@ -526,6 +530,8 @@ def jit(
                 use_del_last_used=False,
             )
             protrace = protraces[-1]
+            if cd.debug_traces_ctx.debug_prologue_trace:
+                protrace._add_breakpoint = True
             pro = protrace.python_callable()
 
             cs.last_prologue_transformation_stop = time.time_ns()
@@ -594,6 +600,8 @@ def jit(
                 computation_trc = extraces[-1]
                 cs.last_computation_transformation_stop = time.time_ns()
 
+            if cd.debug_traces_ctx.debug_computation_trace:
+                computation_trc._add_breakpoint = True
             comp = computation_trc.python_callable()
 
             if backward_trc is not None:

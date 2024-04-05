@@ -8,6 +8,9 @@ from numbers import Number
 from typing import overload, Generic, Optional, TypeVar, TYPE_CHECKING
 from collections.abc import Callable
 from collections.abc import Iterable, Iterator, Sequence
+from collections import namedtuple
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from typing_extensions import Self
 
@@ -1110,3 +1113,16 @@ def partition(pred, iterable):
     # partition(is_odd, range(10)) --> 0 2 4 6 8   and  1 3 5 7 9
     t1, t2 = itertools.tee(iterable)
     return itertools.filterfalse(pred, t1), filter(pred, t2)
+
+
+DebugTraceFlags = namedtuple("DebugFlags", ["debug_prologue_trace", "debug_computation_trace"])
+debug_traces_ctx = ContextVar("debug_traces", default=DebugTraceFlags(False, False))
+
+
+@contextmanager
+def debug_traces(debug_prologue_trace: bool = True, debug_computation_trace: bool = True):
+    token = debug_traces_ctx.set(DebugTraceFlags(debug_prologue_trace, debug_computation_trace))
+    try:
+        yield
+    finally:
+        debug_traces_ctx.reset(token)
