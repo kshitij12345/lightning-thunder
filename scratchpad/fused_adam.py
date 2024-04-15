@@ -128,7 +128,6 @@ def jit_step(optim_func, jit_params, jit_state):
 device = "cuda"
 dim = 1024
 n_param = 100
-# x = torch.randn(2048, 2048, device=device, requires_grad=True)
 params = [torch.randn(dim, dim, device=device, requires_grad=True) for _ in range(n_param)]
 
 # model_name = "open_llama_3b"
@@ -188,8 +187,10 @@ torch.testing.assert_close(params, jit_params)
 
 # print(params[0][0], jit_params[0][0])
 
+# Verify that params have changed.
 # This should crash
 # torch.testing.assert_close(params[0], orig_param)
+
 native_time = Timer(stmt="adam.step()", globals={"adam": adam}).timeit(number=100)
 jit_time = Timer(
     stmt="jit_step(optim_func, jit_params, jit_state)",
@@ -203,4 +204,10 @@ torch.testing.assert_close(params, jit_params, rtol=1e-4, atol=1e-4)
 print(native_time)
 print(jit_time)
 
-# print(thunder.last_traces(_single_tensor_adam)[-1])
+
+exec_trace = thunder.last_traces(optim_func)[-1]
+
+with open("generated_kernels.txt", "w") as f:
+    f.write(exec_trace.python_ctx()["nvFusion0"].last_used.last_cuda_code())
+
+print("Done")
