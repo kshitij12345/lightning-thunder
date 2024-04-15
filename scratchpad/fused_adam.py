@@ -4,11 +4,7 @@ from typing import List, Union, Optional
 import math
 import thunder
 from torch.utils.benchmark import Timer
-from thunder.tests.litgpt_model import Config, GPT, Block
-
-
-def _get_value(x):
-    return x.item()
+from thunder.tests.litgpt_model import Config, GPT
 
 
 def _dispatch_sqrt(x: float):
@@ -176,11 +172,16 @@ adam = torch.optim.Adam(params, fused=True)
 attach_grads(params)
 copy_grads(params, jit_params)
 
+# 2 iterations
+adam.step()
 adam.step()
 
 # # thunder.set_execution_callback_file("foo.py")
 optim_func = thunder.jit(_single_tensor_adam)
 jit_state = get_jit_state(jit_params)
+
+# 2 iterations
+jit_step(optim_func, jit_params, jit_state)
 jit_step(optim_func, jit_params, jit_state)
 
 torch.testing.assert_close(params, jit_params)
