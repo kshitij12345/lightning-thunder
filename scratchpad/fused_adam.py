@@ -207,7 +207,13 @@ print(jit_time)
 
 exec_trace = thunder.last_traces(optim_func)[-1]
 
-with open("generated_kernels.txt", "w") as f:
+with open("generated_thunder_trace.py", "w") as f:
+    f.write(str(exec_trace))
+
+with open("generated_fusion_defintion.py", "w") as f:
+    f.write(str(exec_trace.python_ctx()["nvFusion0"].last_used))
+
+with open("generated_kernels.cu", "w") as f:
     f.write(exec_trace.python_ctx()["nvFusion0"].last_used.last_cuda_code())
 
 print("Done")
