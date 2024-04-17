@@ -5,6 +5,7 @@ import math
 import thunder
 from torch.utils.benchmark import Timer
 from thunder.tests.litgpt_model import Config, GPT
+from thunder.core.transforms import value_and_grad
 
 
 def _dispatch_sqrt(x: float):
@@ -128,96 +129,35 @@ class ThunderAdam:
         jit_step(_single_tensor_adam, self.params, grads, self.state)
 
 
-device = "cuda"
-dim = 1024
-n_param = 100
-params = [torch.randn(dim, dim, device=device, requires_grad=True) for _ in range(n_param)]
-
-# model_name = "open_llama_3b"
-# m = GPT(Config.from_name(model_name)).to(device)
-# params = list(m.parameters())
-# params = params[:50]
-
-with torch.no_grad():
-    orig_param = params[0].clone().detach()
-
-with torch.no_grad():
-    jit_params = [param.clone().detach() for param in params]
-
-for param in jit_params:
-    param.requires_grad_(True)
+def model(x, w1):
+    return (x + w1).sum()
 
 
-def computation_and_backward(params):
-    result = torch.empty_like(params[0])
-    for param in params:
-        result = result + param
+inp = torch.randn(1, 1)
+w1 = torch.randn(1, 1)
 
-    result.sum().backward()
+adam = ThunderAdam([w1])
 
 
-def attach_grads(params):
-    for param in params:
-        param.grad = torch.randn_like(param)
+def train_step(x, w1):
+    output, grads = value_and_grad(model)(x, w1)
+    # Grads are None because of a bug
+    # We create our own grads.
+    # Tie output here so that value_and_grad computation is not
+    # eliminated by DCE
+    grad = torch.randn_like(w1) + output
+    adam.step(
+        [
+            grad,
+        ]
+    )
 
 
-def copy_grads(params, jit_params):
-    for param, jit_param in zip(params, jit_params):
-        jit_param.grad = param.grad.clone().detach()
+jit_train_step = thunder.jit(train_step)
 
+print(w1)
+for _ in range(100):
+    jit_train_step(inp, w1)
+print(w1)
 
-adam = torch.optim.Adam(params, fused=True)
-
-# computation_and_backward(params)
-# computation_and_backward(jit_params)
-
-attach_grads(params)
-copy_grads(params, jit_params)
-
-# 2 iterations
-adam.step()
-adam.step()
-
-# # thunder.set_execution_callback_file("foo.py")
-thunder_adam = ThunderAdam(jit_params)
-
-jit_grads = [param.grad for param in jit_params]
-
-optim_step = thunder.jit(thunder_adam.step)
-# 2 iterations
-optim_step(jit_grads)
-optim_step(jit_grads)
-
-torch.testing.assert_close(params, jit_params)
-
-# print(params[0][0], jit_params[0][0])
-
-# Verify that params have changed.
-# This should crash
-# torch.testing.assert_close(params[0], orig_param)
-
-native_time = Timer(stmt="adam.step()", globals={"adam": adam}).timeit(number=100)
-jit_time = Timer(
-    stmt="optim_step(jit_grads)",
-    globals={"optim_step": optim_step, "jit_grads": jit_grads},
-).timeit(number=100)
-
-# Sanity after 100 iterations
-torch.testing.assert_close(params, jit_params, rtol=1e-4, atol=1e-4)
-# print(params[0][0], jit_params[0][0])
-
-print(native_time)
-print(jit_time)
-
-exec_trace = thunder.last_traces(optim_step)[-1]
-
-with open("generated_thunder_trace.py", "w") as f:
-    f.write(str(exec_trace))
-
-with open("generated_fusion_defintion.py", "w") as f:
-    f.write(str(exec_trace.python_ctx()["nvFusion0"].last_used))
-
-with open("generated_kernels.cu", "w") as f:
-    f.write(exec_trace.python_ctx()["nvFusion0"].last_used.last_cuda_code())
-
-print("Done")
+print(thunder.last_traces(jit_train_step)[-1])
