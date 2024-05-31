@@ -27,20 +27,23 @@ from nvtx_profiler.profile_transform import (
     nvtx_profile_transform,
     nvtx_profiler_ex,
     profile_with_nvtx,
-    profile_as_post_opt_tfms,
 )
 
+# import nvtx
+# profile = nvtx.Profile()
+# profile.enable()
 # jmodel = profile_as_post_opt_tfms(thunder.jit(model))
 # jmodel(x)
 torch.cuda.cudart().cudaProfilerStart()
 jmodel = thunder.jit(
     model,
     post_optimization_transforms=[
-        nvtx_profile_transform,
+        # nvtx_profile_transform,
     ],
 )
 o = jmodel(x)
 o.sum().backward()
 torch.cuda.cudart().cudaProfilerStop()
+# profile.disable()
 print(thunder.last_traces(jmodel)[-1])
 print(thunder.last_backward_traces(jmodel)[-1])
