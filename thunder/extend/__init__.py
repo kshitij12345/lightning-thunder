@@ -219,7 +219,6 @@ class OperatorExecutor(Executor):
         bind_postprocess: None | Callable = None,
         replaces: None | Callable = None,
         python_printer: Callable = default_python_printer,
-        tags: None | list[Any] = None,
     ) -> Symbol:
         ln = like is None
         mn = meta is None
