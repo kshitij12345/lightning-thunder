@@ -2,7 +2,7 @@ import enum
 import sys
 import os
 import itertools
-from typing import Any, List
+from typing import Any
 from collections.abc import Sequence
 from collections.abc import Callable
 from collections.abc import Hashable
