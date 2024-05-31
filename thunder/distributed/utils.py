@@ -51,10 +51,7 @@ def sort_data_parallel_syncs(primal_trace):
         return primal_trace
 
 
-# TODO: Currently prefer the most memory-efficient way for ZeRO3,
-# Need a strategy to balance the efficiency
-# and memory usage in the future
-def sort_waits_for_zero3(execution_trace):
+def sort_communication_ops(execution_trace):
     """
     Sorts the wait_prim_impl nodes in the execution trace to be as far from the
     communication ops as possible, except for the all_gather_prim_impl nodes, the all_gather_prim_impl nodes
@@ -84,12 +81,12 @@ def sort_waits_for_zero3(execution_trace):
         # nodes over "wait_prim_impl", pick "all_gather_prim_impl" last.
         def key(node: Node) -> int:
             match node.bsym.sym.id:
-                case (wait_prim_impl.id | unpack_for_fsdp_prim_impl.id):
+                case wait_prim_impl.id | unpack_for_fsdp_prim_impl.id:
                     return len(order_in_trace)
-                case (reduce_scatter_prim_impl.id | all_reduce_prim_impl.id):
+                case reduce_scatter_prim_impl.id | all_reduce_prim_impl.id:
                     # Prefer larger communication ops over smaller ones
                     return -node.bsym.args[0].numel
-                case (all_gather_prim_impl.id):
+                case all_gather_prim_impl.id:
                     return len(order_in_trace) + order_in_trace[node.bsym]
                 case _:
                     # Prefer nodes that are earlier in the trace
@@ -141,9 +138,9 @@ def sort_waits(execution_trace):
         # nodes over "wait_prim_impl"
         def key(node: Node) -> int:
             match node.bsym.sym.id:
-                case (wait_prim_impl.id):
+                case wait_prim_impl.id:
                     return len(order_in_trace)
-                case (reduce_scatter_prim_impl.id | all_reduce_prim_impl.id | all_gather_prim_impl.id):
+                case reduce_scatter_prim_impl.id | all_reduce_prim_impl.id | all_gather_prim_impl.id:
                     # Prefer larger communication ops over smaller ones
                     return -node.bsym.args[0].numel
                 case _:

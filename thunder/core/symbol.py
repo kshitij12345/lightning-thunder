@@ -15,7 +15,7 @@ from collections.abc import Sequence
 
 import thunder.core.baseutils as baseutils
 import thunder.core.codeutils as codeutils
-from thunder.core.codeutils import Printable
+from thunder.core.codeutils import Printable, Positions
 from thunder.core.baseutils import BoundSymbolInterface, ProxyInterface
 from thunder.core.pytree import tree_flatten, tree_unflatten, tree_map
 import thunder.core.dtypes as dtypes
@@ -129,7 +129,7 @@ class Symbol:
     meta: Callable | None = None
     id: None | Any = None
     is_prim: bool = False
-    tags: None | list[Any] = None
+    tags: None | list[OpTags] = None
     is_fusion: bool = False
     python_printer: Callable = default_python_printer
     _module: None | type | ModuleType = None
@@ -149,7 +149,9 @@ class Symbol:
     # If both IDs are none, then symbols with the same name and module are equal.
     def __hash__(self) -> int:
         if self._hash is None:
-            object.__setattr__(self, "_hash", hash((self.name, self._module, self.id)))
+            h = hash((self.name, self._module, self.id))
+            object.__setattr__(self, "_hash", h)
+            return h
         return self._hash
 
     # Symbols are equal if they have the same id (if present),
@@ -200,6 +202,7 @@ class Symbol:
         return f"[Symbol name={self.name}]"
 
     def normalize(self, *args, **kwargs):
+        assert self.meta is not None
         si = inspect.signature(self.meta)
         ba = si.bind(*args, **kwargs)
         ba.apply_defaults()
@@ -210,6 +213,14 @@ class Symbol:
         if self.meta is not None:
             args, kwargs = self.normalize(*args, **kwargs)
 
+        trace = get_tracectx()
+        if trace is not None:
+            source_filename = trace._current_source_filename
+            source_positions = trace._current_source_positions
+        else:
+            source_filename = None
+            source_positions = None
+
         b = BoundSymbol(
             self,
             args=args,
@@ -217,6 +228,8 @@ class Symbol:
             output=output,
             subsymbols=subsymbols,
             header=_bsym_header.get(),
+            source_filename=source_filename,
+            source_positions=source_positions,
             _call_ctx=_call_ctx,
         )
         if self._bind_postprocess:
@@ -226,11 +239,15 @@ class Symbol:
     def __call__(self, *args, **kwargs):
         trace = get_tracectx()
 
-        baseutils.check(
-            trace is not None,
-            lambda: f"Attempting to execute outside of a tracing context, which is not supported",
-            exception_type=NotImplementedError,
-        )
+        if trace is None:
+            raise NotImplementedError(
+                f"Attempting to execute symbol {self.name} outside of a tracing context, which is not supported."
+            )
+
+        if self.meta is None:
+            raise NotImplementedError(
+                f"Symbol {self.name} of executor {self.executor} does not have a meta function defined"
+            )
 
         baseutils.check(not trace._complete, lambda: f"Trying to add {self} to a trace that is complete!")
         result: Any
@@ -242,7 +259,7 @@ class Symbol:
             if symbols_list is None:
                 return self.meta(*args, **kwargs)
 
-            trace.push_scope(None)
+            trace.push_scope(None)  # BUG: This is wrong, push_scope only accepts lists. What should this be instead?
             result = self.meta(*args, **kwargs)
             trace.pop_scope()
         else:
@@ -258,6 +275,7 @@ class Symbol:
             lambda: f"A symbol {self} was called while processing a primitive",
             exception_type=AssertionError,
         )
+        assert symbols_list is not None
 
         symbols_list.append(bsym)
         return result
@@ -286,6 +304,8 @@ class BoundSymbol(BoundSymbolInterface):
 
     # Header is a string that may be printed before the symbol
     header: str | list[str] = ""
+    source_filename: str | None = None
+    source_positions: Positions | None = None
 
     _call_ctx: None | dict[str, Any] = None
 
@@ -316,6 +336,8 @@ class BoundSymbol(BoundSymbolInterface):
             "output": self.output,
             "subsymbols": self.subsymbols,
             "header": self.header,
+            "source_filename": self.source_filename,
+            "source_positions": self.source_positions,
             "_call_ctx": self._call_ctx,
             "_import_ctx": self._import_ctx,
             "_object_ctx": self._object_ctx,
@@ -404,7 +426,7 @@ class BoundSymbol(BoundSymbolInterface):
             for bsym in self.subsymbols:
                 subsymbols.append(bsym.from_bsym_swap_proxies(swap_map, skip_inputs, skip_output, skip_subsymbols))
         else:
-            subsymbols = self.subsymbols
+            subsymbols = list(self.subsymbols)
 
         return self.from_bsym(args=nargs, kwargs=nkwargs, output=new_output, subsymbols=subsymbols)
 
@@ -508,12 +530,13 @@ class BoundSymbol(BoundSymbolInterface):
 
     # TODO Document contexts
     def import_ctx(self):
-        # NOTE This initializes the context
-        self._out_printables, self._arg_printables, self._kwarg_printables
+        # NOTE This initializes the context (Accessing these properties is a function call with the desired side effect)
+        self._out_printables, self._arg_printables, self._kwarg_printables  # type: ignore
         if self.sym is not None and self.sym.python_impl is not None:
             # NOTE BoundSymbols of Symbols with a python_impl defined are run in Python, and are assumed
             #   to not need any imports to run properly, unless _import_prims is True
             if self.sym._print_as_impl:
+                assert self.sym.module is not None  # TODO: Is this a valid assumption?
                 module_name = self.sym.module.__name__
                 import_ctx = {module_name: self.sym.module}
             else:
@@ -525,6 +548,7 @@ class BoundSymbol(BoundSymbolInterface):
             # BoundSymbols of Symbols without Python implementations (either because they
             #   have Python implementations or defined call ctxs) are assumed to need
             #   a module import to run properly
+            assert self.sym.module is not None  # TODO: Is this a valid assumption?
             module_name = self.sym.module.__name__
             import_ctx = {module_name: self.sym.module}
 
@@ -538,7 +562,7 @@ class BoundSymbol(BoundSymbolInterface):
         return self._import_ctx
 
     def object_ctx(self):
-        # NOTE This initializes the context
+        # NOTE This initializes the context (Accessing these properties is a function call with the desired side effect)
         self._out_printables, self._arg_printables, self._kwarg_printables
 
         return self._object_ctx
@@ -642,7 +666,9 @@ class BoundSymbolRHS:
 
     def __hash__(self) -> int:
         if not self._hash:
-            object.__setattr__(self, "_hash", self._do_hash())
+            h = self._do_hash()
+            object.__setattr__(self, "_hash", h)
+            return h
         return self._hash
 
     # TODO: Deal with kwargs, in __eq__ and __hash__, just like with BoundSymbol.

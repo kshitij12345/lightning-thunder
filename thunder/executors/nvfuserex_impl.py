@@ -9,6 +9,7 @@ import time
 from copy import copy
 from itertools import chain, filterfalse
 from functools import partial
+import warnings
 
 from looseversion import LooseVersion
 import torch
@@ -157,7 +158,7 @@ def is_supported_tensor(a: TensorProxy, *, allow_low_precision_floats: bool = Tr
 
 
 def is_supported_tensor_or_number(a: TensorProxy | Number) -> bool:
-    if isinstance(a, Number):
+    if isinstance(a, (Number, NumberProxy)):
         return True
 
     return is_supported_tensor(a)
@@ -511,9 +512,6 @@ def create_fusion_definition_wrapper(
         return create_fd(bsyms, input_descriptors, sorted_unique_inputs, sorted_unique_outputs)
 
     fdw = FusionDefinitionWrapper(get_fd, name, get_fd.cache_info, get_fd.cache_clear)
-    # Avoid hitting nvFuser error when there is no output
-    if not sorted_unique_outputs:
-        return lambda *args: tuple()
     return fdw
 
 
@@ -787,7 +785,7 @@ class nvFuserExecutor(FusionExecutor):
             region = Region(producers, consumers, bsyms)
 
             # Acquires the nv_enable_bookend compile option, which defaults to True
-            bookend_help = """
+            bookend_help = """\
 nvFuser's 'bookending' heuristic tries to gather metadata operations---such as
 transpose, reshape, or view---into the beginning and ends of blocks that utilize
 nvFuser. By pushing these ops to the edges, they will get dropped by the nvFuser
@@ -834,6 +832,19 @@ instantiated) this heuristic actually leads to worse code.
                 else:
                     fused_bsyms.extend(fusion.bound_symbols)
             fused_bsyms.extend(epilogue)
+
+        # Force return operator to be the last one in the fused_bsyms
+        if fused_bsyms[-1].sym.id != PrimIDs.RETURN:
+            return_idx: int = -1
+            for i, fused_bsym in enumerate(fused_bsyms):
+                if fused_bsym.sym.id == PrimIDs.RETURN:
+                    return_idx = i
+                    break
+            utils.check(
+                return_idx != -1,
+                lambda: f"Return operator does not exist in bound symbols",
+            )
+            fused_bsyms.append(fused_bsyms.pop(return_idx))
 
         fusedtrace.bound_symbols = fused_bsyms
 
@@ -1017,11 +1028,14 @@ def _uniform_philox_check(
     *,
     device: Device,
     dtype: dtypes.dtype,
-    seed: int | TensorProxy,
-    offset: int | TensorProxy,
+    seed: int | NumberProxy | TensorProxy,
+    offset: int | NumberProxy | TensorProxy,
 ) -> bool:
     return (
-        is_supported_device(device) and is_supported_dtype(dtype) and isinstance(seed, int) and isinstance(offset, int)
+        is_supported_device(device)
+        and is_supported_dtype(dtype)
+        and is_supported_tensor_or_number(seed)
+        and is_supported_tensor_or_number(offset)
     )
 
 
@@ -1087,18 +1101,12 @@ register_supported(PrimIDs.BROADCAST_IN_DIM, broadcast_in_dim, _broadcast_in_dim
 
 
 def _cat_check(tensors: list[TensorProxy], dim: int) -> bool:
-    # nvFuser cat fusion is currently disabled due to issue:
-    #   "nvFuser doesn't support cating with an empty tensor"
-    return False
+    if nv_version < LooseVersion("0.1.7"):
+        return False
 
     # Validates tensors and concatenated dimension lengths
     for t in tensors:
         if not is_supported_tensor(t):
-            return False
-
-        # See https://github.com/NVIDIA/Fuser/issues/21
-        #   nvFuser cannot concatenate dimensions of length 1
-        if t.shape[dim] == 1:
             return False
 
     return True
@@ -2006,6 +2014,29 @@ def var_mean(
 register_supported(PrimIDs.VAR_MEAN, var_mean, _var_mean_check)
 
 
+def _copy__check(
+    copy_from: TensorProxy,
+    copy_to: TensorProxy,
+) -> bool:
+    return are_supported_tensors(copy_from, copy_to)
+
+
+def copy_(
+    copy_from: TensorProxy,
+    copy_to: TensorProxy,
+    *,
+    fd: FusionDefinition,
+    lc_to_nv_map: dict,
+) -> Any:
+    nvcopy_from = getnv(copy_from, fd, lc_to_nv_map)
+    nvcopy_to = getnv(copy_to, fd, lc_to_nv_map)
+    fd.add_output(nvcopy_from, alias_input=nvcopy_to)
+    return nvcopy_to
+
+
+register_supported(PrimIDs.COPY_, copy_, _copy__check)
+
+
 # Removes excessive float casts, like those that occur when autocasting
 # NOTE This passes actually changes a program's semantics, because it will take a sequence like
 #   fp32 -> fp16 -> fp32 and remove all the operations, but casting fp32 values to fp16 can
@@ -2167,3 +2198,71 @@ def remove_redundant_casts(trace: TraceCtx) -> tuple[TraceCtx, list[TraceCtx]]:
     elapsed_time_millis = elapsed_time_ns // 1000000
     rrctrace.set_provenance(TraceProvenance(f"Remove redundant casts (took {elapsed_time_millis} milliseconds)"))
     return rrctrace
+
+
+def _linear_check(a: TensorProxy, b: TensorProxy, bias: TensorProxy | None) -> bool:
+    if nv_version < LooseVersion("0.2.3"):
+        return False
+
+    enable_linear: None | bool = get_compile_option("nv_enable_linear", "Enable nvFuser linear.")
+    if not enable_linear:
+        return False
+    # Verify linear inputs and bias (optional) are supported tensors.
+    if not are_supported_tensors(a, b) or (bias is not None and not is_supported_tensor(bias)):
+        return False
+    if nv_version < LooseVersion("0.2.5"):
+        warnings.warn("nvFuser v0.2.3 has limited support for linear. Consider using v0.2.5 or above")
+        # nvFuser only supports 2D inputs in v0.2.3.
+        if not a.ndim == 2:
+            return False
+    return True
+
+
+def linear(
+    a: TensorProxy,
+    b: TensorProxy,
+    bias: TensorProxy | None,
+    *,
+    fd: FusionDefinition,
+    lc_to_nv_map: dict,
+) -> Any:
+    nva = getnv(a, fd, lc_to_nv_map)
+    nvb = getnv(b, fd, lc_to_nv_map)
+    nvbias = None if bias is None else getnv(bias, fd, lc_to_nv_map)
+    return fd.ops.linear(nva, nvb, nvbias)
+
+
+register_supported(PrimIDs.LINEAR, linear, _linear_check)
+
+
+def _matmul_check(
+    a: TensorProxy,
+    b: TensorProxy,
+) -> bool:
+    if nv_version < LooseVersion("0.2.2"):
+        return False
+
+    enable_matmul: None | bool = get_compile_option("nv_enable_matmul", "Enable nvFuser matmul.")
+
+    if not enable_matmul or not are_supported_tensors(a, b):
+        return False
+    if nv_version < LooseVersion("0.2.4"):
+        warnings.warn("nvFuser v0.2.2 has limited support for matmuls. Consider using v0.2.4 or above")
+        if not (a.ndim == b.ndim and a.ndim == 2):
+            return False
+    return True
+
+
+def matmul(
+    a: TensorProxy,
+    b: TensorProxy,
+    *,
+    fd: FusionDefinition,
+    lc_to_nv_map: dict,
+) -> Any:
+    nva = getnv(a, fd, lc_to_nv_map)
+    nvb = getnv(b, fd, lc_to_nv_map)
+    return fd.ops.matmul(nva, nvb)
+
+
+register_supported(PrimIDs.MATMUL, matmul, _matmul_check)

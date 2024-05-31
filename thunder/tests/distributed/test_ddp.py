@@ -8,6 +8,7 @@ import weakref
 from collections.abc import Sequence
 from functools import partial, wraps
 from itertools import product
+from collections.abc import Callable
 
 import pytest
 import torch
@@ -16,10 +17,11 @@ import torch.nn as nn
 import torch.utils.data as tudata
 from torch.distributed import distributed_c10d as c10d
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.fsdp import FullyShardedDataParallel
+from torch.distributed.fsdp.wrap import always_wrap_policy
 from torch.testing import assert_close, make_tensor
 
 import thunder
-from thunder import INTERPRETATION_OPTIONS
 import thunder.torch as ltorch
 from thunder.core import devices
 from thunder.distributed import FSDPBucketingStrategy, FSDPType
@@ -27,6 +29,25 @@ from thunder.distributed import ddp, fsdp
 from thunder.distributed import prims
 from thunder.tests.framework import TorchExecutor, nvFuserExecutor
 from thunder.tests.framework import instantiate
+
+from thunder.executors.transformer_engineex import (
+    transformer_engine_ex,
+    TE_AVAILABLE,
+    TE_VERSION_1_6_PLUS,
+    te_sync_fp8_meta_bwd,
+)
+
+
+is_fp8_supported: bool = False
+# This will be correctly updated below when TE Engine is installed
+# and if the current environment doesn't support FP8.
+fp8_support_reason: str = ""
+if TE_AVAILABLE:
+    from transformer_engine.pytorch import fp8_autocast
+    from transformer_engine.pytorch import Linear as TELinear
+    from transformer_engine.pytorch.fp8 import check_fp8_support, FP8GlobalStateManager
+
+    is_fp8_supported, fp8_support_reason = check_fp8_support()
 
 try:
     import expecttest  # noqa: F401
@@ -184,7 +205,7 @@ class CompileDDPTest(DataParallelTestCase):
             e = c @ b + a
             return e, d
 
-        cfunc = thunder.jit(func, executors_list=_executor.executors_list())
+        cfunc = thunder.jit(func, executors=_executor.executors_list())
         device = f"cuda:{self.rank}"
         a = make_tensor((2, 2), device=device, dtype=torch.float32)
         b = make_tensor((2, 2), device=device, dtype=torch.float32)
@@ -258,7 +279,7 @@ class CompileDDPTest(DataParallelTestCase):
         process_group = c10d.new_group()
 
         # NOTE Preprocessing is disabled because we call thunder.torch operations directly
-        cfoo = thunder.jit(lc_foo, executors_list=_executor.executors_list())
+        cfoo = thunder.jit(lc_foo, executors=_executor.executors_list())
 
         for op, async_op in product((None, torch.distributed.ReduceOp.SUM), (False, True)):
             expected = foo(a, b, op, process_group, async_op)
@@ -310,7 +331,7 @@ class CompileDDPTest(DataParallelTestCase):
         process_group = c10d.new_group()
 
         # NOTE Preprocessing is disabled because we call thunder.torch operations directly
-        cfoo = thunder.jit(lc_foo, executors_list=_executor.executors_list())
+        cfoo = thunder.jit(lc_foo, executors=_executor.executors_list())
 
         for async_op in (True, False):
             expected = foo(a, b, process_group, async_op)
@@ -368,7 +389,7 @@ class CompileDDPTest(DataParallelTestCase):
         process_group = c10d.new_group()
 
         # NOTE Preprocessing is disabled because we call thunder.torch operations directly
-        cfoo = thunder.jit(lc_foo, executors_list=_executor.executors_list())
+        cfoo = thunder.jit(lc_foo, executors=_executor.executors_list())
 
         for async_op in (True, False):
             expected = foo(a, b, process_group, async_op)
@@ -425,7 +446,7 @@ class CompileDDPTest(DataParallelTestCase):
         process_group = c10d.new_group()
 
         # NOTE Preprocessing is disabled because we call thunder.torch operations directly
-        cfoo = thunder.jit(lc_foo, executors_list=_executor.executors_list())
+        cfoo = thunder.jit(lc_foo, executors=_executor.executors_list())
 
         for op, async_op in product((None, torch.distributed.ReduceOp.SUM), (False, True)):
             expected = foo(a, b, op, process_group, async_op)
@@ -447,7 +468,7 @@ class CompileDDPTest(DataParallelTestCase):
         m = ToyModel().to(device)
         cm = thunder.jit(
             ddp(m, bucket_size_in_mb=bucket_size_in_mb),
-            executors_list=executors_map[executor].executors_list(),
+            executors=executors_map[executor].executors_list(),
         )
         x = torch.ones((2, 12)).to(device)
         cm(x).mean().backward()
@@ -480,9 +501,9 @@ class CompileDDPTest(DataParallelTestCase):
         x = torch.ones((2, 12), device=device)
         cm(x).mean().backward()
 
-        (fwd_trc,) = (
+        fwd_trc = [
             t for t in thunder.last_traces(cm) if getattr(t.get_provenance(), "pss", "") == "Augmented forward pass"
-        )
+        ][0]
         bwd_trc = thunder.last_backward_traces(cm)[0]
         from thunder.core.rematerialization import rematerialize_all_gather
 
@@ -492,8 +513,9 @@ class CompileDDPTest(DataParallelTestCase):
         # TODO: this is not stable w.r.t. details of the processing, the sharded correspond to ("t_net1_weight", "t_net2_weight")
         #       in the original trace and are inputs to all_gather, the unshard are the outputs fo the corresponding wait
         #       If you fix this to be dynamically discerned, you'll be my hero.
-        sharded_param_names = ("t3", "t4")
-        unshard_param_names = ("t10", "t21")
+        sharded_param_names = ("t_net1_weight", "t_net2_weight")
+        # t3 and t16 are all-gather'ed t_net1_weight and t_net2_weight, respectively.
+        unshard_param_names = ("t3", "t16")
         result_saved_for_bwd = [x.name for x in fwd_trc.bound_symbols[-1].args[1][0]]
         self.assertTrue(all(t not in sharded_param_names for t in result_saved_for_bwd))
         self.assertTrue(all(t in result_saved_for_bwd for t in unshard_param_names))
@@ -508,6 +530,7 @@ class CompileDDPTest(DataParallelTestCase):
         self.assertTrue(all(bsym.sym.id != PrimIDs.ALL_GATHER for bsym in bwd_trc.bound_symbols))
         self.assertTrue(any(bsym.sym.id == PrimIDs.ALL_GATHER for bsym in result_bwd_trc.bound_symbols))
 
+    @unittest.mock.patch.dict(os.environ, {"KINETO_LOG_LEVEL": "5"})  # silence torch.profiler logs
     @common_utils.parametrize(
         "executor,bucket_size_in_mb,dataset_size",
         product(tuple(executors_map.keys()), (0, 25), (1, 2)),
@@ -519,11 +542,81 @@ class CompileDDPTest(DataParallelTestCase):
         # the trace should have.
         # For numerical parity, we compare the accumulated gradients with and without `no_sync` and even against gradients without accumulation.
         # If they are different, it'd be impossible to keep replicas identical.
-        from collections import defaultdict
-        from contextlib import nullcontext
         from thunder.common import CACHE_OPTIONS
         from thunder.distributed import ddp
         from thunder.distributed import get_skip_data_parallel_grad_sync
+
+        def get_model_and_optimizer(device):
+            m = ToyModel().to(device)
+            ddp_m = ddp(m, bucket_size_in_mb=bucket_size_in_mb)
+            jitted_ddp_m = thunder.jit(
+                ddp_m,
+                cache_mode=CACHE_OPTIONS.CONSTANT_VALUES,
+                executors=executors_map[executor].executors_list(),
+            )
+            optimizer = torch.optim.SGD(jitted_ddp_m.parameters(), lr=1e-3)
+            return jitted_ddp_m, optimizer
+
+        def is_comm(k: str) -> bool:
+            return "allreduce_" in k or "all_reduce" in k
+
+        self._run_no_sync_grad_accumulation_test(get_model_and_optimizer, is_comm, dataset_size)
+
+    @common_utils.parametrize(
+        "executor,bucketing_strategy,fsdptype",
+        product(
+            tuple(executors_map.keys()),
+            (FSDPBucketingStrategy.BLOCK,),
+            (FSDPType.ZERO2, FSDPType.ZERO3),
+        ),
+        name_fn=lambda executor, bucketing_strategy, fsdptype: (
+            f"executor_{executor}_bucketing_{str(bucketing_strategy).split('.')[1].lower()}_{(str(fsdptype).lower().split('.')[1])}"
+        ),
+    )
+    def test_fsdp_with_no_sync_grad_accumulation(
+        self,
+        executor: str,
+        bucketing_strategy: FSDPBucketingStrategy,
+        fsdptype: FSDPType,
+    ):
+        from thunder.common import CACHE_OPTIONS
+        from thunder.distributed import fsdp
+
+        def get_model_and_optimizer(device):
+            m = ToyModel().to(device)
+            fsdp_m = fsdp(m, bucketing_strategy=bucketing_strategy, sharding_strategy=fsdptype)
+            jitted_ddp_m = thunder.jit(
+                fsdp_m,
+                cache_mode=CACHE_OPTIONS.CONSTANT_VALUES,
+                executors=executors_map[executor].executors_list(),
+            )
+            optimizer = torch.optim.SGD(jitted_ddp_m.parameters(), lr=1e-3)
+            return jitted_ddp_m, optimizer
+
+        def is_comm(k: str) -> bool:
+            return "reducescatter" in k or "reduce_scatter" in k
+
+        self._run_no_sync_grad_accumulation_test(get_model_and_optimizer, is_comm, dataset_size=2)
+
+    def _run_no_sync_grad_accumulation_test(
+        self,
+        get_model_and_optimizer: Callable[[torch.device], tuple[torch.nn.Module, torch.optim.Optimizer]],
+        is_comm: Callable[[str], bool],
+        dataset_size,
+    ):
+        from collections import defaultdict
+        from contextlib import nullcontext
+        from thunder.distributed import get_skip_data_parallel_grad_sync
+
+        device = torch.device("cuda", self.rank)
+        batch_size = 128
+        num_micro_batch = 4
+        micro_batch_size = batch_size // num_micro_batch
+        with torch.no_grad():
+            dataloader = [
+                (torch.randn(batch_size, 12, device=device), torch.randn(batch_size, 8, device=device))
+                for _ in range(dataset_size)
+            ]
 
         # TODO(crcrpar): Use `last_traces` to check if allreduce was called, instead of `torch.profiler.profile`
         # See: https://github.com/Lightning-AI/lightning-thunder/pull/1881#issuecomment-1910455732
@@ -536,25 +629,14 @@ class CompileDDPTest(DataParallelTestCase):
                 loss.backward()
 
             keys = tuple([e.key for e in prof.key_averages()])
-            has_allreduce = any(("allreduce_" in k or "all_reduce" in k) for k in keys)
+            has_comms = any(is_comm(k) for k in keys)
             msg = f"{keys=}"
             if get_skip_data_parallel_grad_sync():
-                self.assertFalse(has_allreduce, msg=msg)
+                self.assertFalse(has_comms, msg=msg)
             else:
-                self.assertTrue(has_allreduce, msg=msg)
+                self.assertTrue(has_comms, msg=msg)
 
             return loss
-
-        def get_model_and_optimizer(device):
-            m = ToyModel().to(device)
-            ddp_m = ddp(m, bucket_size_in_mb=bucket_size_in_mb)
-            compiled_ddp_m = thunder.jit(
-                ddp_m,
-                cache_mode=CACHE_OPTIONS.CONSTANT_VALUES,
-                executors_list=executors_map[executor].executors_list(),
-            )
-            optimizer = torch.optim.SGD(compiled_ddp_m.parameters(), lr=1e-3)
-            return compiled_ddp_m, optimizer
 
         def get_ground_truth_loss_grads(device, dataloader):
             compiled_ddp_m, optimizer = get_model_and_optimizer(device)
@@ -571,43 +653,37 @@ class CompileDDPTest(DataParallelTestCase):
             return initial_state_dict, losses, grads
 
         device = torch.device("cuda", self.rank)
-
-        batch_size = 128
-        num_micro_batch = 4
-        micro_batch_size = batch_size // num_micro_batch
-        with torch.no_grad():
-            dataloader = [
-                (torch.randn(batch_size, 12, device=device), torch.randn(batch_size, 8, device=device))
-                for _ in range(dataset_size)
-            ]
-
         initial_state_dict, ground_truth_losses, ground_truth_grads = get_ground_truth_loss_grads(device, dataloader)
 
         gradients = defaultdict(list)
         for use_no_sync in (True, False):
-            compiled_ddp_m, optimizer = get_model_and_optimizer(device)
-            compiled_ddp_m.load_state_dict(initial_state_dict)
+            jitted_model, optimizer = get_model_and_optimizer(device)
+            jitted_model.load_state_dict(initial_state_dict)
 
             for iter_count, (x, y) in enumerate(dataloader):
                 loss = torch.zeros((), device=device)
-                with compiled_ddp_m.no_sync() if use_no_sync else nullcontext():
+                with jitted_model.no_sync() if use_no_sync else nullcontext():
                     for i in range(num_micro_batch - 1):
                         cur_loss = run_fwd_bwd(
                             iter_count,
-                            compiled_ddp_m,
+                            jitted_model,
                             x[i * micro_batch_size : (i + 1) * micro_batch_size, :],
                             y[i * micro_batch_size : (i + 1) * micro_batch_size, :],
                             num_micro_batch,
                         )
                         with torch.no_grad():
                             loss += cur_loss
+                        if use_no_sync and i == 0 and iter_count == 0:
+                            # make sure the backward trace under `no_sync` has actual math computations.
+                            no_sync_bwd_trc = thunder.last_backward_traces(jitted_model)[-1]
+                            self.assertGreater(len(no_sync_bwd_trc.bound_symbols), 1)
                 cur_loss = run_fwd_bwd(
-                    iter_count, compiled_ddp_m, x[-micro_batch_size:, :], y[-micro_batch_size:, :], num_micro_batch
+                    iter_count, jitted_model, x[-micro_batch_size:, :], y[-micro_batch_size:, :], num_micro_batch
                 )
                 with torch.no_grad():
                     loss += cur_loss
                 optimizer.step()
-                gradients[use_no_sync].append([p.grad for p in compiled_ddp_m.parameters() if p.grad is not None])
+                gradients[use_no_sync].append([p.grad for p in jitted_model.parameters() if p.grad is not None])
                 optimizer.zero_grad(set_to_none=True)
 
                 num_expected_caches: int
@@ -615,7 +691,7 @@ class CompileDDPTest(DataParallelTestCase):
                     num_expected_caches = 2
                 else:
                     num_expected_caches = 1
-                self.assertEqual(len(compiled_ddp_m._lc_cs.interpreter_cache), num_expected_caches)
+                self.assertEqual(len(jitted_model._lc_cs.interpreter_cache), num_expected_caches)
 
                 torch.testing.assert_close(loss, ground_truth_losses[iter_count], atol=1e-4, rtol=1e-4)
                 torch.testing.assert_close(
@@ -642,7 +718,7 @@ class CompileDDPTest(DataParallelTestCase):
             m.load_state_dict(initial_model_state)
             cm = thunder.jit(
                 ddp(m, bucket_size_in_mb=bucket_size_in_mb),
-                executors_list=executors_map[executor].executors_list(),
+                executors=executors_map[executor].executors_list(),
             )
             x = torch.ones((2, 12)).to(device)
             cm(x).mean().backward()
@@ -654,14 +730,18 @@ class CompileDDPTest(DataParallelTestCase):
 
     # TODO(crcrpar): Add torch compile to executors_list
     @common_utils.parametrize(
-        "executor,bucketing_strategy,fsdptype",
+        "executor,bucketing_strategy,fsdptype,apply_fsdp_first",
         product(
             tuple(executors_map.keys()),
-            (FSDPBucketingStrategy.LAYER, FSDPBucketingStrategy.BLOCK),
+            (
+                FSDPBucketingStrategy.LAYER,
+                FSDPBucketingStrategy.BLOCK,
+            ),
             (FSDPType.ZERO2, FSDPType.ZERO3),
+            (True, False),
         ),
-        name_fn=lambda executor, bucketing_strategy, fsdptype: (
-            f"executor_{executor}_bucketing_{str(bucketing_strategy).split('.')[1].lower()}_{(str(fsdptype).lower().split('.')[1])}"
+        name_fn=lambda executor, bucketing_strategy, fsdptype, apply_fsdp_first: (
+            f"executor_{executor}_bucketing_{str(bucketing_strategy).split('.')[1].lower()}_{(str(fsdptype).lower().split('.')[1])}_{'jit_fsdp' if apply_fsdp_first else 'fsdp_jit'}"
         ),
     )
     def test_fsdp_grad_parity_with_without_bucketing(
@@ -669,6 +749,7 @@ class CompileDDPTest(DataParallelTestCase):
         executor,
         bucketing_strategy: FSDPBucketingStrategy,
         fsdptype: FSDPType,
+        apply_fsdp_first: bool,
     ):
         from thunder.distributed import fsdp
 
@@ -678,10 +759,18 @@ class CompileDDPTest(DataParallelTestCase):
         for strategy in (FSDPBucketingStrategy.NONE, bucketing_strategy):
             m = ToyModel()
             m.load_state_dict(initial_model_state)
-            cm = thunder.jit(
-                fsdp(m, device=device, bucketing_strategy=bucketing_strategy, sharding_strategy=fsdptype),
-                executors_list=executors_map[executor].executors_list(),
-            )
+            if apply_fsdp_first:
+                cm = thunder.jit(
+                    fsdp(m, device=device, bucketing_strategy=bucketing_strategy, sharding_strategy=fsdptype),
+                    executors=executors_map[executor].executors_list(),
+                )
+            else:
+                cm = fsdp(
+                    thunder.jit(m.to(device), executors=executors_map[executor].executors_list()),
+                    device=device,
+                    bucketing_strategy=bucketing_strategy,
+                    sharding_strategy=fsdptype,
+                )
             x = torch.ones((2, 12), device=device)
             loss = cm(x).mean()
             loss.backward()
@@ -693,6 +782,77 @@ class CompileDDPTest(DataParallelTestCase):
                 self.assertEqual(loss, orig_loss)
                 self.assertEqual(tuple(p.grad for p in cm.parameters() if p.grad is not None), gradients)
 
+                # Make sure that at least one of "pack" takes multiple tensors.
+                from thunder.executors.torchex import pack_for_fsdp_prim_impl
+                from thunder.distributed.prims import PrimIDs as DistPrimIDs
+
+                for ex_trace in (thunder.last_traces(cm)[-1], thunder.last_backward_traces(cm)[-1]):
+                    pack_bsyms = list(
+                        filter(
+                            lambda bsym: bsym.sym.id in {DistPrimIDs.PACK_FOR_FSDP, pack_for_fsdp_prim_impl.id},
+                            ex_trace.bound_symbols,
+                        )
+                    )
+                    self.assertGreater(len(pack_bsyms), 0)
+                    has_pack_multiple_tensors = False
+                    for bsym in pack_bsyms:
+                        first_arg = bsym.args[0]
+                        self.assertIsInstance(first_arg, list)
+                        has_pack_multiple_tensors |= len(first_arg) > 1
+                    # note(crcrpar): The way creating a bucket name from an FQN could be better for models with simple structure
+                    # see https://github.com/Lightning-AI/lightning-thunder/blob/b24e5b23/thunder/distributed/__init__.py#L278-L301
+                    if bucketing_strategy == FSDPBucketingStrategy.LAYER:
+                        self.assertTrue(has_pack_multiple_tensors, msg=f"{[bsym.args[0] for bsym in pack_bsyms]=}")
+
+    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires 2 devices")
+    @common_utils.parametrize(
+        "bucketing_strategy,fsdptype",
+        product(
+            (
+                FSDPBucketingStrategy.NONE,
+                FSDPBucketingStrategy.BLOCK,
+            ),
+            (FSDPType.ZERO2, FSDPType.ZERO3),
+        ),
+        name_fn=lambda bucketing_strategy, fsdptype: (
+            f"bucketing_{str(bucketing_strategy).split('.')[1].lower()}_{(str(fsdptype).lower().split('.')[1])}"
+        ),
+    )
+    def test_fsdp_with_padding(
+        self,
+        bucketing_strategy: FSDPBucketingStrategy,
+        fsdptype: FSDPType,
+    ):
+
+        from thunder.core.prims import PrimIDs
+        from thunder.executors.torchex import pad_prim_impl
+        from thunder.executors.torchex import slice_prim_impl
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.l1 = nn.Linear(4, 13)
+                self.l2 = nn.Linear(13, 1)
+
+            def forward(self, x):
+                return self.l2(new_gelu(self.l1(x)))
+
+        device = torch.device(f"cuda:{self.rank}")
+        m = M().to(device)
+        jitted = thunder.jit(fsdp(m, bucketing_strategy=bucketing_strategy, sharding_strategy=fsdptype))
+
+        x = torch.randn(4, 4, device=device)
+        y = jitted(x)
+        y.mean().backward()
+
+        fw_extrace = thunder.last_traces(jitted)[-1]
+        fw_symids = [bsym.sym.id for bsym in fw_extrace.bound_symbols]
+        self.assertTrue(any(sym_id in {PrimIDs.SLICE, slice_prim_impl.id} for sym_id in fw_symids))
+
+        bw_trace = thunder.last_backward_traces(jitted)[0]
+        bw_symids = [bsym.sym.id for bsym in bw_trace.bound_symbols]
+        self.assertTrue(any(sym_id in {PrimIDs.PAD, pad_prim_impl.id} for sym_id in bw_symids))
+
     @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires 2 devices")
     def test_fsdp_shard_unshard(self):
         from thunder.distributed import _shard_params, _unshard_params
@@ -703,6 +863,7 @@ class CompileDDPTest(DataParallelTestCase):
         model = torch.nn.Linear(3, 5, bias=False, device="meta")
         with pytest.raises(RuntimeError, match=r"parameter 'weight' \(5\) to be divisible by the world size \(2\)"):
             _shard_params(model, pg, device, None)
+        _shard_params(model, pg, device, None, allow_padding_for_fsdp=True)
 
         model = torch.nn.Linear(3, 4, bias=False, device="meta")
         weight = torch.arange(3 * 4, device="cpu", dtype=torch.float).view(4, 3)
@@ -822,8 +983,7 @@ class CompileDDPTest(DataParallelTestCase):
         m = Block(config).to(device=device)
         cm = thunder.jit(
             fsdp(m, device=device, broadcast_from=0, bucketing_strategy=bucketing_strategy, sharding_strategy=fsdptype),
-            interpretation=INTERPRETATION_OPTIONS.TRANSLATE_PYTHON,
-            executors_list=executors_map[executor].executors_list(),
+            executors=executors_map[executor].executors_list(),
         )
         x = torch.ones((2, config.block_size, config.n_embd), device=device)
         loss = cm(x).mean()
@@ -856,6 +1016,70 @@ class CompileDDPTest(DataParallelTestCase):
         model = thunder.distributed.ddp(model)
         fwd_loss = thunder.jit(fwd_loss)
         fwd_loss(model, x)
+
+        # notice how we cannot do `model.no_sync()` because it's not a ThunderModule
+        with thunder.ThunderModule.no_sync(model):
+            fwd_loss(model, x)
+
+    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires 2 devices")
+    def test_fsdp_weight_sharing(self):
+        # This test is to verify that weight sharing works with fsdp.
+        # NOTE: Currently we end up creating 2 copies of shared weight during execution.
+        #       This should be fixed and we should update this test to check for that.
+        device = torch.device("cuda", self.rank)
+
+        class Model(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fc1 = torch.nn.Linear(16, 16, bias=False)
+                self.fc2 = torch.nn.Linear(16, 16, bias=False)
+
+            def forward(self, x):
+                return self.fc1(x) + self.fc2(x)
+
+        def _test_model_output_and_gradients(model, x):
+            output = model(x)
+            with device:
+                grad_output = torch.ones_like(output)
+            output.backward(grad_output)
+            expected_shape = (4, 16)
+
+            assert output.shape == expected_shape, f"{output.shape=} - {expected_shape=}"
+
+            # Verify that both params point to same grad tensor.
+            assert id(model.get_parameter("fc1.weight").grad) == id(model.get_parameter("fc2.weight").grad)
+
+            # Verify that we accumulate the gradients for the shared parameter.
+            gathered_grad_shape = (model.get_parameter("fc1.weight").shape[0] * self.world_size,) + model.get_parameter(
+                "fc1.weight"
+            ).shape[1:]
+            with device:
+                actual_grad_gathered = torch.empty(gathered_grad_shape)
+
+            tdist.all_gather_into_tensor(actual_grad_gathered, model.get_parameter("fc1.weight").grad)
+
+            # Based on the forward, grad for both params is `(grad_output.T @ x)`. Multiplying by 2 as the grad will be accumulated.
+            expected_grad = 2 * (grad_output.T @ x)
+            torch.testing.assert_close(actual_grad_gathered, expected_grad)
+
+        with device:
+            jit_fsdp_model = Model()
+            fsdp_jit_model = Model()
+            x = torch.ones(4, 16)
+
+        # Check `jit(fsdp(model))` works
+        jit_fsdp_model.fc1.weight = jit_fsdp_model.fc2.weight
+
+        jit_fsdp_model = thunder.jit(thunder.distributed.fsdp(jit_fsdp_model), executors=["torch"])
+
+        _test_model_output_and_gradients(jit_fsdp_model, x)
+
+        # Check `fsdp(jit(model))` works
+        fsdp_jit_model.fc1.weight = fsdp_jit_model.fc2.weight
+
+        fsdp_jit_model = thunder.distributed.fsdp(thunder.jit(fsdp_jit_model, executors=["torch"]))
+
+        _test_model_output_and_gradients(fsdp_jit_model, x)
 
 
 common_utils.instantiate_parametrized_tests(CompileDDPTest)
@@ -999,12 +1223,12 @@ class ddp_wrapper:
         init_method = f"{FILE_SCHEMA}{file_name}"
 
         @wraps(test_stub)
-        def test_fn(executor, devices, dtype, bucket_size_in_mb=0):
+        def test_fn(executor, devices, dtype, **kwargs):
             world_size = len(devices)
             input_data = []
 
             for rank in range(world_size):
-                process_data = (init_method, world_size, rank, executor, devices[rank], dtype, bucket_size_in_mb)
+                process_data = (init_method, world_size, rank, executor, devices[rank], dtype, kwargs)
                 input_data.append(process_data)
 
             ctx = mp.get_context("spawn")
@@ -1039,7 +1263,8 @@ class ddp_wrapper:
 # NOTE This assumes that one process will have rank=0 -- could generalize that to root
 # TODO Test training, this test just currently tests forward
 def _test_native_ddp_helper(input_data):
-    init_method, world_size, rank, executor, device, dtype, bucket_size_in_mb = input_data
+    init_method, world_size, rank, executor, device, dtype, kwargs = input_data
+    bucket_size_in_mb = kwargs.get("bucket_size_in_mb", 0)
 
     num_samples = 2
     tensor_shape = (2, 2)
@@ -1065,7 +1290,7 @@ def _test_native_ddp_helper(input_data):
     ddp_model = ddp(model)
     cmodel = thunder.jit(
         ddp_model,
-        executors_list=executor.executors_list(),
+        executors=executor.executors_list(),
     )
 
     comparison_exceptions = []
@@ -1131,7 +1356,8 @@ def _test_native_ddp_helper(input_data):
 
 
 def _test_native_fsdp_helper(input_data):
-    init_method, world_size, rank, executor, device, dtype, bucketing_strategy = input_data
+    init_method, world_size, rank, executor, device, dtype, kwargs = input_data
+    bucketing_strategy = kwargs["fsdp_bucketing_strategy"]
 
     num_samples = 2
     tensor_shape = (2, 2)
@@ -1165,17 +1391,16 @@ def _test_native_fsdp_helper(input_data):
 
     original_weight_net1_shape = model.net1.weight.shape
 
-    fsdp_model = fsdp(model, bucketing_strategy=bucketing_strategy, device=device)
+    cmodel0 = thunder.jit(
+        model,
+        executors=executor.executors_list(),
+    )
+    cmodel = fsdp(cmodel0, bucketing_strategy=bucketing_strategy, device=device)
 
     # Check that the model is sharded
-    sharded_weight_net1 = fsdp_model.net1.weight
+    sharded_weight_net1 = cmodel.get_parameter("net1.weight")
     assert sharded_weight_net1.shape != original_weight_net1_shape
     assert sharded_weight_net1.shape == (1, 2)
-
-    cmodel = thunder.jit(
-        fsdp_model,
-        executors_list=executor.executors_list(),
-    )
 
     comparison_exceptions = []
     for _ in range(num_epochs):
@@ -1214,6 +1439,366 @@ def _test_native_fsdp_helper(input_data):
     return None
 
 
+def _test_ddp_transformer_engine(input_data):
+    # Test Description: We run a dummy training loop for a simple `Linear(Relu(Linear(x)))`
+    # model with thunder (using TE executor) and with PyTorch eager + TE
+    # and verify that the weights have converged to same value and
+    # fp8 meta state is same after `n_iter`.
+    init_method, world_size, rank, executor, device, dtype, _unused_kwargs = input_data
+    devicetype = devices.device_from_string(device).devicetype
+    _unused_dtype = ltorch.to_torch_dtype(dtype)
+    init_per_process_distributed(init_method, devicetype, world_size, rank)
+
+    torch.cuda.set_device(rank)
+
+    dim = 256
+    n_iter = 10
+
+    class ThunderModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fc1 = torch.nn.Linear(dim, dim, bias=False)
+            self.fc2 = torch.nn.Linear(dim, dim, bias=False)
+
+        def forward(self, x):
+            return self.fc2(torch.nn.functional.relu(self.fc1(x)))
+
+    # Weights
+    fc1_weight = torch.randn(dim, dim, requires_grad=True).cuda()
+    fc2_weight = torch.randn(dim, dim, requires_grad=True).cuda()
+
+    # Inputs (different input on different rank).
+    if rank == 0:
+        x = torch.arange(dim * dim, dtype=torch.float).view(dim, dim).cuda()
+    if rank == 1:
+        x = torch.randn(dim, dim).cuda() * 100
+
+    thunder_model = ThunderModel().cuda()
+    thunder_model.fc1.weight.data = fc1_weight.clone()
+    thunder_model.fc2.weight.data = fc2_weight.clone()
+
+    jit_model = thunder.jit(
+        thunder.distributed.ddp(thunder_model),
+        executors=[
+            transformer_engine_ex,
+        ]
+        + executor.executors_list(),
+    )
+
+    optim = torch.optim.SGD(thunder_model.parameters())
+
+    for _ in range(n_iter):
+        o = jit_model(x).sum()
+        o.backward()
+        optim.step()
+        optim.zero_grad()
+
+    # See https://github.com/NVIDIA/TransformerEngine/issues/814
+    FP8GlobalStateManager.reset()
+
+    class TEModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fc1 = TELinear(dim, dim, bias=False)
+            self.fc2 = TELinear(dim, dim, bias=False)
+
+        def forward(self, x):
+            return self.fc2(torch.nn.functional.relu(self.fc1(x)))
+
+    te_model = TEModel().cuda()
+    te_model.fc1.weight.data = fc1_weight.clone()
+    te_model.fc2.weight.data = fc2_weight.clone()
+
+    ddp_model = DDP(te_model)
+
+    optim = torch.optim.SGD(te_model.parameters())
+
+    for _ in range(n_iter):
+        with fp8_autocast():
+            o = ddp_model(x).sum()
+
+        o.backward()
+        optim.step()
+        optim.zero_grad()
+
+    thunder_to_te_layer_map = {"te_linear_0": te_model.fc1, "te_linear_1": te_model.fc2}
+
+    fwd_traces = thunder.last_traces(jit_model)
+
+    def is_same_across_ranks(t):
+        t_clone = t.clone()
+        torch.distributed.all_reduce(t_clone, op=torch.distributed.ReduceOp.AVG)
+        assert_close(t, t_clone)
+
+    # Compare the state of the two models.
+    comparison_exceptions = []
+    for bound_symbol in fwd_traces[-1].bound_symbols:
+        if "te_linear" in bound_symbol.sym.name:
+            thunder_fp8_meta = bound_symbol._call_ctx[bound_symbol.sym.name].func.fp8_meta
+            te_fp8_meta = thunder_to_te_layer_map[bound_symbol.sym.name].fp8_meta
+            try:
+                # fwd tensor history
+                assert_close(thunder_fp8_meta["scaling_fwd"].scale, te_fp8_meta["scaling_fwd"].scale)
+                assert_close(thunder_fp8_meta["scaling_fwd"].scale_inv, te_fp8_meta["scaling_fwd"].scale_inv)
+                assert_close(thunder_fp8_meta["scaling_fwd"].amax_history, te_fp8_meta["scaling_fwd"].amax_history)
+                # bwd tensor history
+                assert_close(thunder_fp8_meta["scaling_bwd"].scale, te_fp8_meta["scaling_bwd"].scale)
+                assert_close(thunder_fp8_meta["scaling_bwd"].scale_inv, te_fp8_meta["scaling_bwd"].scale_inv)
+                assert_close(thunder_fp8_meta["scaling_bwd"].amax_history, te_fp8_meta["scaling_bwd"].amax_history)
+
+                # This has to be on all ranks so that the computation is not blocked
+                is_same_across_ranks(thunder_fp8_meta["scaling_fwd"].scale)
+                is_same_across_ranks(thunder_fp8_meta["scaling_fwd"].scale_inv)
+                # NOTE: TE forward tensor meta-data sync
+                # Syncing of FP8 meta-data happens in two step in the forward pass.
+                # 1. When we enter the fp8_autocast(), all the forward fp8 meta-data
+                # in global buffer is synced.
+                # See: https://github.com/NVIDIA/TransformerEngine/blob/6a9edc38bf9b941b7d369af5103fa8fe0b121d61/transformer_engine/pytorch/fp8.py#L409-L412
+                # 2. Post this, in the forward pass of the module in `prepare_forward`,
+                # we read from the global-buffer the synced meta-data.
+                # See: https://github.com/NVIDIA/TransformerEngine/blob/6a9edc38bf9b941b7d369af5103fa8fe0b121d61/transformer_engine/pytorch/module/base.py#L539-L545
+                # However, at the end of this forward pass, we have seen new inputs and outputs. Their amax are recorded on
+                # 0th row of `amax_history` (which will be synced only in the next forward pass).
+                # So, here we check that every row except for `0` is same.
+                is_same_across_ranks(thunder_fp8_meta["scaling_fwd"].amax_history[1:])
+                is_same_across_ranks(thunder_fp8_meta["scaling_bwd"].scale)
+                is_same_across_ranks(thunder_fp8_meta["scaling_bwd"].scale_inv)
+                is_same_across_ranks(thunder_fp8_meta["scaling_bwd"].amax_history)
+            except Exception as e:
+                # Return exceptions only for rank==0
+                if rank == 0:
+                    comparison_exceptions.append(e)
+
+    # Compare weights after `n_iters`
+    try:
+        assert_close(thunder_model.fc1.weight, te_model.fc1.weight)
+        assert_close(thunder_model.fc2.weight, te_model.fc2.weight)
+    except Exception as e:
+        # Return exceptions only for rank==0
+        if rank == 0:
+            comparison_exceptions.append(e)
+
+    return comparison_exceptions
+
+
+def _test_ddp_transformer_engine_llama_sanity(input_data):
+    # Test Description: We run a dummy training loop for a Transformer Model
+    # We run a few iterations to see that TransformerEngine doesn't throw internal assertion
+    # due to reordering of forward and backward operators.
+    # (This test will fail without `_rearrange_transformer_engine_linear` in `torch_autograd.py`)
+    # For more details, see docstring for `_rearrange_transformer_engine_linear` in transformer_engine_ex.py.
+    from thunder.tests.llama2_model import Transformer, ModelArgs
+
+    init_method, world_size, rank, executor, device, dtype, _unused_kwargs = input_data
+    devicetype = devices.device_from_string(device).devicetype
+    _unused_dtype = ltorch.to_torch_dtype(dtype)
+    init_per_process_distributed(init_method, devicetype, world_size, rank)
+
+    torch.cuda.set_device(rank)
+    # data
+    batch_size = 2
+    max_seq_len = 32
+    vocab_size = 32
+
+    model_args = dict(
+        dim=32,
+        n_layers=1,
+        n_heads=2,
+        n_kv_heads=2,
+        vocab_size=vocab_size,
+        multiple_of=32,
+        max_seq_len=max_seq_len,
+        dropout=0.0,
+    )
+    gptconf = ModelArgs(**model_args)
+    model = Transformer(gptconf)
+    model.to(device)
+    x = torch.randint(0, vocab_size, (batch_size, max_seq_len), dtype=torch.int64, device=device)
+    y = torch.randint(0, vocab_size, (batch_size, max_seq_len), dtype=torch.int64, device=device)
+    jit_model = thunder.jit(
+        thunder.distributed.ddp(model), executors=(transformer_engine_ex,) + thunder.get_default_executors()
+    )
+
+    sanity_exceptions = []
+    try:
+        for _ in range(5):
+            out = jit_model(x, y).sum()
+            out.backward()
+
+        fwd_exec_trace = thunder.last_traces(jit_model)[-1]
+        bwd_exec_trace = thunder.last_backward_traces(jit_model)[-1]
+
+        if TE_VERSION_1_6_PLUS:
+            # Verify that the symbol to sync backward
+            # fp8 metadata is present in backward trace.
+            for bsym in reversed(bwd_exec_trace.bound_symbols):
+                if bsym.sym.id == te_sync_fp8_meta_bwd.id:
+                    break
+            else:
+                raise RuntimeError("Backward sync symbol not found.")
+
+        else:
+            # Verify that the first te_linear in fwd_exec_trace is the
+            # last one in bwd_exec_tarce.
+            # We verify that by managing the `ctx` (CollectionProxy) output by `te_linear` which is
+            # passed to backward.
+            # As CollectionProxy don't implement __eq__, we verify them by name.
+            first_ctx_name = None
+            for bsym in fwd_exec_trace.bound_symbols:
+                if bsym.sym.name.startswith("te_linear"):
+                    first_ctx_name = bsym.output[1].name
+                    break
+
+            for bsym in reversed(bwd_exec_trace.bound_symbols):
+                if bsym.sym.name.startswith("te_functional"):
+                    assert first_ctx_name == bsym.args[-1].name, (first_ctx_name, bsym.args[-1].name)
+                    break
+    except Exception as e:
+        sanity_exceptions.append(e)
+
+    if rank == 0:
+        return sanity_exceptions
+    return None
+
+
+def _test_fsdp_transformer_engine(input_data):
+    # Test Description: We run a dummy training loop for a simple `Linear(Relu(Linear(x)))`
+    # model with thunder (using TE executor) and with PyTorch eager + TE
+    # and verify that the weights have converged to same value and
+    # fp8 meta state is same after `n_iter`.
+    init_method, world_size, rank, executor, device, _unused_dtype, kwargs = input_data
+    thunder_fsdp_strategy = kwargs["thunder_fsdp_strategy"]
+    devicetype = devices.device_from_string(device).devicetype
+
+    # Setting LOCAL_RANK is necessary for thunder.distributed.fsdp
+    with unittest.mock.patch.dict(os.environ, {"LOCAL_RANK": str(rank)}):
+        init_per_process_distributed(init_method, devicetype, world_size, rank)
+        torch.cuda.set_device(rank)
+
+        dim = 256
+        n_iter = 10
+
+        class ThunderModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fc1 = torch.nn.Linear(dim, dim, bias=False)
+                self.fc2 = torch.nn.Linear(dim, dim, bias=False)
+
+            def forward(self, x):
+                return self.fc2(torch.nn.functional.relu(self.fc1(x)))
+
+        # Weights
+        fc1_weight = torch.randn(dim, dim, requires_grad=True, device="cuda")
+        fc2_weight = torch.randn(dim, dim, requires_grad=True, device="cuda")
+
+        # Inputs (different input on different rank).
+        if rank == 0:
+            x = torch.arange(dim * dim, dtype=torch.float, device="cuda").view(dim, dim)
+        if rank == 1:
+            x = torch.randn(dim, dim, device="cuda") * 100
+
+        with torch.device("cuda"):
+            thunder_model = ThunderModel()
+        thunder_model.fc1.weight.data = fc1_weight.clone()
+        thunder_model.fc2.weight.data = fc2_weight.clone()
+
+        jit_model = thunder.jit(
+            thunder.distributed.fsdp(thunder_model, sharding_strategy=thunder_fsdp_strategy),
+            executors=[
+                transformer_engine_ex,
+            ]
+            + executor.executors_list(),
+        )
+
+        optim = torch.optim.SGD(thunder_model.parameters())
+
+        for _ in range(n_iter):
+            o = jit_model(x).sum()
+            o.backward()
+            optim.step()
+            optim.zero_grad()
+
+        # See https://github.com/NVIDIA/TransformerEngine/issues/814
+        FP8GlobalStateManager.reset()
+
+        class TEModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fc1 = TELinear(dim, dim, bias=False)
+                self.fc2 = TELinear(dim, dim, bias=False)
+
+            def forward(self, x):
+                return self.fc2(torch.nn.functional.relu(self.fc1(x)))
+
+        with torch.device("cuda"):
+            te_model = TEModel()
+        te_model.fc1.weight.data = fc1_weight.clone()
+        te_model.fc2.weight.data = fc2_weight.clone()
+
+        fsdp_model = FullyShardedDataParallel(te_model, auto_wrap_policy=always_wrap_policy)
+
+        optim = torch.optim.SGD(te_model.parameters())
+
+        for _ in range(n_iter):
+            with fp8_autocast():
+                o = fsdp_model(x).sum()
+
+            o.backward()
+            optim.step()
+            optim.zero_grad()
+
+        thunder_to_te_layer_map = {"te_linear_0": te_model.fc1, "te_linear_1": te_model.fc2}
+
+        fwd_traces = thunder.last_traces(jit_model)
+
+        def is_same_across_ranks(t):
+            t_clone = t.clone()
+            torch.distributed.all_reduce(t_clone, op=torch.distributed.ReduceOp.AVG)
+            assert_close(t, t_clone)
+
+        # Compare the state of the two models.
+        comparison_exceptions = []
+        for bound_symbol in fwd_traces[-1].bound_symbols:
+            if "te_linear" in bound_symbol.sym.name:
+                thunder_fp8_meta = bound_symbol._call_ctx[bound_symbol.sym.name].func.fp8_meta
+                te_fp8_meta = thunder_to_te_layer_map[bound_symbol.sym.name].fp8_meta
+                try:
+                    # fwd tensor history
+                    assert_close(thunder_fp8_meta["scaling_fwd"].scale, te_fp8_meta["scaling_fwd"].scale)
+                    assert_close(thunder_fp8_meta["scaling_fwd"].scale_inv, te_fp8_meta["scaling_fwd"].scale_inv)
+                    assert_close(thunder_fp8_meta["scaling_fwd"].amax_history, te_fp8_meta["scaling_fwd"].amax_history)
+                    # bwd tensor history
+                    assert_close(thunder_fp8_meta["scaling_bwd"].scale, te_fp8_meta["scaling_bwd"].scale)
+                    assert_close(thunder_fp8_meta["scaling_bwd"].scale_inv, te_fp8_meta["scaling_bwd"].scale_inv)
+                    assert_close(thunder_fp8_meta["scaling_bwd"].amax_history, te_fp8_meta["scaling_bwd"].amax_history)
+
+                    # This has to be on all ranks so that the computation is not blocked
+                    is_same_across_ranks(thunder_fp8_meta["scaling_fwd"].scale)
+                    is_same_across_ranks(thunder_fp8_meta["scaling_fwd"].scale_inv)
+                    # See NOTE: TE forward tensor meta-data sync
+                    is_same_across_ranks(thunder_fp8_meta["scaling_fwd"].amax_history[1:])
+                    is_same_across_ranks(thunder_fp8_meta["scaling_bwd"].scale)
+                    is_same_across_ranks(thunder_fp8_meta["scaling_bwd"].scale_inv)
+                    is_same_across_ranks(thunder_fp8_meta["scaling_bwd"].amax_history)
+                except Exception as e:
+                    # Return exceptions only for rank==0
+                    if rank == 0:
+                        comparison_exceptions.append(e)
+
+        # Compare weights after `n_iters`
+        shard_size = int(dim / world_size)
+        fsdp_te_params = tuple(te_model.parameters())
+        try:
+            assert_close(thunder_model.fc1.weight, fsdp_te_params[0].view(shard_size, dim))
+            assert_close(thunder_model.fc2.weight, fsdp_te_params[1].view(shard_size, dim))
+        except Exception as e:
+            # Return exceptions only for rank==0
+            if rank == 0:
+                comparison_exceptions.append(e)
+
+        return comparison_exceptions
+
+
 # NOTE This is just a stub, see the NOTE for ddp_wrapper
 @instantiate(
     dtypes=(thunder.float32,),
@@ -1233,7 +1818,7 @@ def test_native_ddp(executor, devices, dtype, bucket_size_in_mb):
     devicetypes=(devices.DeviceType.CUDA,),
     decorators=(
         pytest.mark.parametrize(
-            "bucket_size_in_mb",
+            "fsdp_bucketing_strategy",
             (
                 FSDPBucketingStrategy.NONE,
                 FSDPBucketingStrategy.LAYER,
@@ -1243,7 +1828,79 @@ def test_native_ddp(executor, devices, dtype, bucket_size_in_mb):
     ),
 )
 @ddp_wrapper("test_native_fsdp", _test_native_fsdp_helper)
-def test_native_fsdp(executor, devices, dtype, bucket_size_in_mb):
+def test_native_fsdp(executor, devices, dtype, fsdp_bucketing_strategy):
+    pass
+
+
+@instantiate(
+    dtypes=(thunder.float32,),
+    num_devices=2,
+    devicetypes=(devices.DeviceType.CUDA,),
+    executors=(TorchExecutor,),
+    decorators=(
+        pytest.mark.skipif(not TE_AVAILABLE, reason="TransformerEngine is not installed."),
+        pytest.mark.skipif(not is_fp8_supported, reason=fp8_support_reason),
+        # NOTE: Setting `NVTE_TORCH_COMPILE`
+        # It is important to set this flag so that TE doesn't use
+        # `torch.compile` to fuse a few operations. This is because
+        # `torch.compile` creates a new process and that leads to
+        # the error : daemonic processes are not allowed to have children
+        # when running the tests.
+        # With the setting below, we use `torch.jit` for this test suite
+        # See: https://github.com/NVIDIA/TransformerEngine/blob/a38b291b0d1b04847e8ab1df8550df642a03a27d/transformer_engine/pytorch/jit.py#L11-L19
+        # NOTE: We don't pass `clear=True` to `unittest.mock.patch.dict` as that may clear paths
+        # from environment leading to picking up of incorrect dependencies in the spawned process.
+        unittest.mock.patch.dict(os.environ, {"NVTE_TORCH_COMPILE": "0"}),
+    ),
+)
+@ddp_wrapper("test_ddp_transformer_engine", _test_ddp_transformer_engine)
+def test_ddp_transformer_engine(executor, devices, dtype):
+    pass
+
+
+@instantiate(
+    dtypes=(thunder.float32,),
+    num_devices=2,
+    devicetypes=(devices.DeviceType.CUDA,),
+    executors=(TorchExecutor,),
+    decorators=(
+        pytest.mark.skipif(not TE_AVAILABLE, reason="TransformerEngine is not installed."),
+        pytest.mark.skipif(not is_fp8_supported, reason=fp8_support_reason),
+        # See NOTE: Setting `NVTE_TORCH_COMPILE`
+        # NOTE: We don't pass `clear=True` to `unittest.mock.patch.dict` as that may clear paths
+        # from environment leading to picking up of incorrect dependencies in the spawned process.
+        unittest.mock.patch.dict(os.environ, {"NVTE_TORCH_COMPILE": "0"}),
+    ),
+)
+@ddp_wrapper("test_ddp_transformer_engine_llama_sanity", _test_ddp_transformer_engine_llama_sanity)
+def test_ddp_transformer_engine_llama_sanity(executor, devices, dtype):
+    pass
+
+
+@instantiate(
+    dtypes=(thunder.float32,),
+    num_devices=2,
+    devicetypes=(devices.DeviceType.CUDA,),
+    executors=(TorchExecutor,),
+    decorators=(
+        # NOTE: ddp_wrapper
+        pytest.mark.parametrize(
+            "thunder_fsdp_strategy",
+            (
+                FSDPType.ZERO2,
+                FSDPType.ZERO3,
+            ),
+        ),
+        pytest.mark.skipif(not TE_AVAILABLE, reason="TransformerEngine is not installed."),
+        pytest.mark.skipif(not is_fp8_supported, reason=fp8_support_reason),
+        # See NOTE: Setting `NVTE_TORCH_COMPILE`
+        # NOTE: We don't pass `clear=True` to `unittest.mock.patch.dict` as that may clear paths
+        # from environment leading to picking up of incorrect dependencies in the spawned process.
+        unittest.mock.patch.dict(os.environ, {"NVTE_TORCH_COMPILE": "0"}),
+    ),
+)
+@ddp_wrapper("test_fsdp_transformer_engine", _test_fsdp_transformer_engine)
+def test_fsdp_transformer_engine(executor, devices, dtype, thunder_fsdp_strategy):
     pass
 
 

@@ -23,7 +23,7 @@ def snippet_errors(op, sample, ex_type, err_msg_match=None):
 
 
 @ops(tuple(op for op in opinfos if op.error_input_generator is not None))
-def test_errors(op, device, _, executor, comp):
+def test_errors(op, device, dtype, executor, comp):
     for sample, ex_type, err_msg in op.error_inputs(device):
         result = run_snippet(snippet_errors, op, device, None, executor.make_callable(op.op), sample, ex_type, err_msg)
         if result is not None:
@@ -33,7 +33,7 @@ def test_errors(op, device, _, executor, comp):
 # Snippets run a single test using a single sample
 # TODO: should snippets be able to access the original opinfo? -- No?
 # TODO: revisit atol/rtol, maybe be more selective about which ops need a more permissive check
-def snippet_torch_consistency(op, torch_op, sample, comp):
+def snippet_torch_consistency(op: OpInfo, torch_op, sample: SampleInput, comp: Callable):
     thunder_result = op(*sample.args, **sample.kwargs)
     torch_result = torch_op(*sample.args, **sample.kwargs)
 
@@ -83,6 +83,10 @@ def test_core_vs_torch_consistency(op, device: str, dtype: dtypes.dtype, executo
             sample,
             lambda a, b: comp(a, b, equal_nan=True),
         )
+
+        # See [NOTE] dynamo reset
+        if any("torchcompile" in ex.name for ex in executor.executors_list()):
+            torch._dynamo.reset()
 
         if result is not None:
             return result

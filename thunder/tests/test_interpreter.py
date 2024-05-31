@@ -19,7 +19,9 @@ from thunder.core.interpreter import (
     make_opaque,
     interpret,
     InterpreterError,
-    print_last_interpreted_history,
+    print_interpreter_log,
+    last_interpreter_log,
+    last_interpreted_instructions,
 )
 
 #
@@ -1030,6 +1032,56 @@ def test_reduce_jitted_reduce_fn(jit):
     assert jfoo((1, 2, 3), jadd) == 6
 
 
+def test_namedtuple_lookaside(jit):
+    from collections import namedtuple
+
+    typename = "MyNamedTuple"
+    field_names = ("a", "b", "c")
+
+    # Test returnign just the type {
+    def f():
+        return namedtuple(typename, field_names)
+
+    jf = jit(f)
+
+    jtype = jf()
+    assert isinstance(jtype, type)
+    assert jtype.__name__ == typename
+    assert all(hasattr(jtype, field) for field in field_names)
+
+    # Check module name
+    import inspect
+
+    assert jtype.__module__ == inspect.currentframe().f_globals["__name__"]
+    # }
+
+    # Test accessing elements {
+    a = torch.rand(1)
+    b = torch.rand(1)
+    c = torch.rand(1)
+
+    def f(a, b, c):
+        nt = namedtuple(typename, field_names)
+        obj = nt(a, b, c)
+        return obj[0]
+
+    jf = jit(f)
+
+    assert f(a, b, c) is a
+    assert jf(a, b, c) is a
+
+    def f(a, b, c):
+        nt = namedtuple(typename, field_names)
+        obj = nt(a, b, c)
+        return obj.a
+
+    jf = jit(f)
+
+    assert f(a, b, c) is a
+    assert jf(a, b, c) is a
+    # }
+
+
 def test_calling_methods(jit):
     jitting = False
 
@@ -1402,13 +1454,13 @@ def test_match_statement(jit):
             case _:
                 assert False
 
-    jfoo = jit(foo)
+    jfoo = jit(foo, record_history=True)
     assert foo() == 3
     assert jfoo() == 3
-    assert any(i.opname == "MATCH_KEYS" for i in jfoo._last_interpreted_instructions)
-    assert any(i.opname == "MATCH_MAPPING" for i in jfoo._last_interpreted_instructions)
+    assert any(i.opname == "MATCH_KEYS" for i in last_interpreted_instructions(jfoo))
+    assert any(i.opname == "MATCH_MAPPING" for i in last_interpreted_instructions(jfoo))
     if "COPY_DICT_WITHOUT_KEYS" in dis.opmap.keys():
-        assert any(i.opname == "COPY_DICT_WITHOUT_KEYS" for i in jfoo._last_interpreted_instructions)
+        assert any(i.opname == "COPY_DICT_WITHOUT_KEYS" for i in last_interpreted_instructions(jfoo))
 
     # Test MATCH_SEQUENCE
     def bar():
@@ -1420,12 +1472,12 @@ def test_match_statement(jit):
             case _:
                 assert False
 
-    jbar = jit(bar)
+    jbar = jit(bar, record_history=True)
     assert bar() == 3
     assert jbar() == 3
-    assert any(i.opname == "MATCH_SEQUENCE" for i in jbar._last_interpreted_instructions)
-    assert any(i.opname == "GET_LEN" for i in jbar._last_interpreted_instructions)
-    assert any(i.opname == "UNPACK_EX" for i in jbar._last_interpreted_instructions)
+    assert any(i.opname == "MATCH_SEQUENCE" for i in last_interpreted_instructions(jbar))
+    assert any(i.opname == "GET_LEN" for i in last_interpreted_instructions(jbar))
+    assert any(i.opname == "UNPACK_EX" for i in last_interpreted_instructions(jbar))
 
 
 def test_class_match_statement(jit):
@@ -1446,10 +1498,10 @@ def test_class_match_statement(jit):
             case _:
                 assert False
 
-    jfoo = jit(foo)
+    jfoo = jit(foo, record_history=True)
     assert foo() == 3
     assert jfoo() == 3
-    assert any(i.opname == "MATCH_CLASS" for i in jfoo._last_interpreted_instructions)
+    assert any(i.opname == "MATCH_CLASS" for i in last_interpreted_instructions(jfoo))
 
 
 def test_match_fallthrough(jit):
@@ -1521,6 +1573,52 @@ def test_unhashable_lookaside(jit):
         wr()
 
     jit(fn)()
+
+
+def test_enumerate_lookaside(jit):
+    jitting = False
+
+    class mycls:
+        def __init__(self, val):
+            self.list = [val] * 3
+
+        def __iter__(self):
+            assert is_jitting_with_raise() == jitting
+            return self.list.__iter__()
+
+    def foo(a, start=0):
+        return list(enumerate(a, start))
+
+    o = mycls(2)
+    jfoo = jit(foo)
+
+    jitting = False
+    res1 = foo(o)
+    res2 = foo([1, 2, 3], 8)
+    res3 = foo("mystr", True)
+    res4 = foo(o, -3)
+
+    jitting = True
+    jres1 = jfoo(o)
+    jres2 = jfoo([1, 2, 3], 8)
+    jres3 = jfoo("mystr", True)
+    jres4 = jfoo(o, -3)
+    assert res1 == jres1
+    assert res2 == jres2
+    assert res3 == jres3
+    assert res4 == jres4
+
+    with pytest.raises(TypeError, match="object is not iterable$"):
+        jfoo(12)
+
+    class myclsnotiterable:
+        def __init__(self):
+            pass
+
+    with pytest.raises(TypeError, match="object is not iterable$"):
+        jfoo(myclsnotiterable())
+    with pytest.raises(TypeError, match="object cannot be interpreted as an integer$"):
+        jfoo(o, -2.5)
 
 
 def test_len_lookaside(jit):
@@ -2623,7 +2721,7 @@ def test_displayhook(jit):
         def smt(s):
             interpreter.runsource(s)
 
-        smt("from thunder.core.interpreter import interpret")
+        smt("from thunder.core.interpreter import interpret, last_interpreted_instructions")
         smt(
             """
 def foo():
@@ -2636,9 +2734,9 @@ def foo():
     print('Reset.')
 """
         )
-        smt("jfoo = interpret(foo)")
+        smt("jfoo = interpret(foo, record_history=True)")
         smt("jfoo()")
-        smt("assert any(i.opname == 'PRINT_EXPR' for i in jfoo._last_interpreted_instructions)")
+        smt("assert any(i.opname == 'PRINT_EXPR' for i in last_interpreted_instructions(jfoo))")
 
     py_out: str = py_redirect.getvalue()
     assert py_out == "redirected 5\nredirected 6\nredirected 7\nReset.\n", py_out
@@ -2652,7 +2750,7 @@ def test_load_build_class(jit):
 
         return C, C().bar
 
-    jfoo = jit(foo)
+    jfoo = jit(foo, record_history=True)
 
     cp, cb = foo()
     jp, jb = jfoo()
@@ -2660,7 +2758,7 @@ def test_load_build_class(jit):
     assert cp().bar == jp().bar
 
     assert any(i.opname == "LOAD_BUILD_CLASS" for i in dis.get_instructions(foo))
-    assert any(i.opname == "LOAD_BUILD_CLASS" for i in jfoo._last_interpreted_instructions)
+    assert any(i.opname == "LOAD_BUILD_CLASS" for i in last_interpreted_instructions(jfoo))
 
 
 def test_with(jit):
@@ -2847,6 +2945,24 @@ def test_super(jit):
     assert res == jres
 
 
+def test_print_log_types(jit):
+    def foo():
+        return 5
+
+    jfoo = jit(foo, record_history=True)
+    jfoo()
+
+    log = last_interpreter_log(jfoo)
+
+    # print into string
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        print_interpreter_log(log, use_colors=False, indent=False)
+    bufstr = buf.getvalue()
+
+    assert "Returning from call to test_print_log_types.<locals>.foo() with value of type int" in bufstr
+
+
 def test_is_jitting_with_raise(jit):
     def foo():
         return is_jitting_with_raise()
@@ -2923,28 +3039,28 @@ def test_module_hooks(jit):
 
         x = torch.randn(3, 4)
 
-        jm = jit(m)
+        jm = jit(m, record_history=True)
         y = jm(x)
         y.sum().backward()
 
-        # Find the hook registration in the history the normal way
+        # Find the hook registration in the log the normal way
         found = False
-        for item in jm._last_interpreted_history:
+        for item in last_interpreter_log(jm):
             if (not isinstance(item, dict)) or (item["kind"] != "Opaque"):
                 continue
             _fn = item["fn"]
-            if _fn == torch._C._FunctionBase.register_hook:  # type: ignore
+            if _fn == torch._C._FunctionBase.register_hook.__qualname__:  # type: ignore
                 found = True
                 break
 
         assert found
 
-        # Redirect print_last_interpreted_history from stdout to a string, and assert that it's in there.
+        # Redirect print_last_interpreter_log from stdout to a string, and assert that it's in there.
         buf = io.StringIO()
         with redirect_stdout(buf):
-            print_last_interpreted_history(jm, use_colors=False, indent=False)
+            print_interpreter_log(last_interpreter_log(jm), use_colors=False, indent=False)
 
-        match_against = "Opaque call to <method 'register_hook' of 'torch._C._FunctionBase' objects> with name _FunctionBase.register_hook"
+        match_against = "Opaque call to _FunctionBase.register_hook()"
         assert match_against in buf.getvalue()
         buf.close()
 
