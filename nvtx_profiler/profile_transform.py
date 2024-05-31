@@ -97,11 +97,11 @@ def nvtx_profile_transform(trace: Trace, **kwargs) -> Trace:
         profile_trace = from_trace(trace)
 
         # Start profiling
-        profile_trace.bound_symbols.append(cuda_profiler_start.bind(output=None))
+        # profile_trace.bound_symbols.append(cuda_profiler_start.bind(output=None))
         for bound_symbol in trace.bound_symbols:
             # Synchronize and stop profiling at return.
             if PrimIDs.RETURN == bound_symbol.sym.id:
-                profile_trace.bound_symbols.append(cuda_profiler_stop.bind(output=None))
+                # profile_trace.bound_symbols.append(cuda_profiler_stop.bind(output=None))
                 profile_trace.bound_symbols.append(bound_symbol)
                 break
 

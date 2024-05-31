@@ -277,6 +277,7 @@ def jit(
     disable_torch_autograd: bool = False,  # TODO Revisit this UX for RC1
     early_transforms: list | None = None,
     additional_transforms: list | None = None,
+    post_optimization_transforms: list | None = None,
     record_history: bool = False,
     **compile_options,  # TODO RC1 Make this explicit -- dict of options
 ) -> Callable:
@@ -320,6 +321,9 @@ def jit(
 
     if additional_transforms is None:
         additional_transforms = []
+
+    if post_optimization_transforms is None:
+        post_optimization_transforms = []
 
     # Resolve names of executors
     executors = resolve_executors(executors)
@@ -592,6 +596,13 @@ def jit(
 
             if not compile_options.get("disable_inplace_copy_check", False):
                 thunder.core.transform_common._inplace_copy_sanity_check(computation_trc)
+
+            for transform in post_optimization_transforms:
+                computation_trc = transform(computation_trc)
+                computation_traces.append(computation_trc)
+                backward_trc = transform(backward_trc)
+                backward_traces.append(backward_trc)
+
             comp = computation_trc.python_callable()
 
             if backward_trc is not None:
