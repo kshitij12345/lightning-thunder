@@ -118,14 +118,3 @@ def nvtx_profile_transform(trace: Trace, **kwargs) -> Trace:
         TraceProvenance(f"Profile Transform (took {timer.get_elapsed_time_in_ms()} milliseconds)")
     )
     return profile_trace
-
-
-def profile_with_nvtx(compiled_model):
-    def _fn(*args, **kwargs):
-        exec_trace = thunder.last_traces(compiled_model)[-1]
-        profile_trace = nvtx_profile_transform(exec_trace)
-        cache_rec, inputs, _ = thunder.compile_data(compiled_model).get_computation_and_inputs(*args, **kwargs)
-        profile_callable = profile_trace.python_callable()
-        return profile_callable(*inputs)
-
-    return _fn

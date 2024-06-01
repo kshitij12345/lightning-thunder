@@ -600,8 +600,9 @@ def jit(
             for transform in post_optimization_transforms:
                 computation_trc = transform(computation_trc)
                 computation_traces.append(computation_trc)
-                backward_trc = transform(backward_trc)
-                backward_traces.append(backward_trc)
+                if backward_trc is not None:
+                    backward_trc = transform(backward_trc)
+                    backward_traces.append(backward_trc)
 
             comp = computation_trc.python_callable()
 
@@ -692,7 +693,7 @@ def jit(
     fn_._lc_cs = cs
     fn_._lc_early_transforms = early_transforms[:]  ## transforms
     fn_._lc_transforms = additional_transforms[:]  ## transforms
-    fn_._lc_post_optimization_transforms = []  ## post_optimization_transforms
+    fn_._lc_post_optimization_transforms = post_optimization_transforms[:]  ## post_optimization_transforms
 
     return fn_
 
