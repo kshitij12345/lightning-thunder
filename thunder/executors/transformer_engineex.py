@@ -36,8 +36,8 @@ TE_AVAILABLE: bool = package_available("transformer_engine")
 # Ex. addition of a positional argument for cpu_offloading (not as the last argument)
 # between version 1.2 and 1.3.
 # Hence, we have these guards based on version.
-TE_VERSION_1_3_PLUS: bool = False
 TE_VERSION_1_6_PLUS: bool = False
+TE_VERSION_1_8_PLUS: bool = False
 
 te: None | Any = None
 if TE_AVAILABLE:
@@ -48,12 +48,19 @@ if TE_AVAILABLE:
         from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
         from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
         from transformer_engine.pytorch.utils import check_dim_for_fp8_exec
+        import transformer_engine_extensions as tex
+        from transformer_engine.pytorch.cpu_offload import CPUOffloadEnabled
     except Exception as ex:
         warnings.warn(f"transformer_engine failed to import with exception {ex}")
         TE_AVAILABLE = False
 
-    TE_VERSION_1_3_PLUS = LooseVersion(version("transformer_engine")) >= LooseVersion("1.3")
-    TE_VERSION_1_6_PLUS = LooseVersion(version("transformer_engine")) > LooseVersion("1.6")
+    if LooseVersion(version("transformer_engine")) < LooseVersion("1.6"):
+        warnings.warn(
+            f"This version of transformer_engine {version('transformer_engine')} is not supported. Please upgrade to newer version"
+        )
+        TE_AVAILABLE = False
+    TE_VERSION_1_8_PLUS = LooseVersion(version("transformer_engine")) > LooseVersion("1.6")
+
 if not TE_AVAILABLE:
     TransformerEngineBaseModule = object
 
@@ -162,17 +169,17 @@ class TELinear(TransformerEngineBaseModule):
             raise RuntimeError("Primary weights in FP8 is not supported under `thunder.jit`.")
 
         # Required by `get_fp8_weights_scratchpad`
-        self.fp8_weight_shapes.append(torch.Size((self.out_features, self.in_features)))
+        if not TE_VERSION_1_8_PLUS:
+            self.fp8_weight_shapes.append(torch.Size((self.out_features, self.in_features)))
 
-        if TE_VERSION_1_6_PLUS:
-            # NOTE: Backward FP8 metadata sync
-            # TransformerEngine v1.6 onwards, we control the sync and update of FP8 metadata for FP8 tensors
-            # tied to backward pass (i.e. the gradient tensors)
-            # Also, note that the forward tensor metadata sync occurs at the exit of `fp8_autocast` context manager
-            # which is not controlled by us.
-            #
-            # We consume the `is_first_fp8_module` so that the automatic sync for FP8 metadata is disabled.
-            FP8GlobalStateManager.is_first_fp8_module()  # Consume first module token.
+        # NOTE: Backward FP8 metadata sync
+        # TransformerEngine v1.6 onwards, we control the sync and update of FP8 metadata for FP8 tensors
+        # tied to backward pass (i.e. the gradient tensors)
+        # Also, note that the forward tensor metadata sync occurs at the exit of `fp8_autocast` context manager
+        # which is not controlled by us.
+        #
+        # We consume the `is_first_fp8_module` so that the automatic sync for FP8 metadata is disabled.
+        FP8GlobalStateManager.is_first_fp8_module()  # Consume first module token.
 
     def forward(self, inp, weight, bias, is_first_microbatch: bool | None = None, is_grad_enabled: bool = False):
         tensor_inputs = tuple(filter(lambda t: isinstance(t, torch.Tensor), (inp, weight, bias)))
@@ -185,14 +192,31 @@ class TELinear(TransformerEngineBaseModule):
             assert (
                 self.fp8 or not self.primary_weights_in_fp8
             ), "Need to run inside fp8_autocast region when weights are stored in FP8."
-            # Fetch the fp8 weights placeholders (for linear/gemm)
-            weight1_fp8, weight1_t_fp8 = self.get_fp8_weights_scratchpad(is_first_microbatch)
+            if not TE_VERSION_1_8_PLUS:
+                # Fetch the fp8 weights placeholders (for linear/gemm)
+                weight_fp8, weight_t_fp8 = self.get_fp8_weights_scratchpad(is_first_microbatch)
+            else:
+                # Initialize FP8 weights if needed
+                weight_fp8 = None
+
+                with_transpose = True  #  torch.is_grad_enabled()
+                # FP8 cast to workspace buffer
+                update_workspace = is_first_microbatch is None or is_first_microbatch
+                skip_fp8_weight_update = False
+
+                weight_fp8 = self.get_fp8_workspace(
+                    tensor=weight,
+                    fp8_meta_forward=True,
+                    fp8_meta_index=tex.FP8FwdTensors.GEMM1_WEIGHT,
+                    cache_name=(None if is_first_microbatch is None else "weight"),
+                    update_workspace=update_workspace,
+                    skip_update_flag=skip_fp8_weight_update,
+                    with_transpose=with_transpose,
+                )
 
             ctx = Context() if is_grad_enabled else None
 
             CPUOffloadEnabled: None | bool = None
-            if TE_VERSION_1_3_PLUS:
-                from transformer_engine.pytorch.cpu_offload import CPUOffloadEnabled
 
             import inspect
 
@@ -204,8 +228,8 @@ class TELinear(TransformerEngineBaseModule):
             kwargs = {
                 "ctx": ctx,
                 "weight": weight,
-                "weight_fp8": weight1_fp8,
-                "weight_t_fp8": weight1_t_fp8,
+                "weight_fp8": weight_fp8,
+                # "weight_t_fp8": weight1_t_fp8,
                 "inp": inp,
                 "bias": torch.tensor([]) if not use_bias else bias,
                 "use_bias": bias is not None,
@@ -221,16 +245,15 @@ class TELinear(TransformerEngineBaseModule):
                 "activation_dtype": inp.dtype,
                 "parallel_mode": None,
                 "is_grad_enabled": is_grad_enabled,
-                "primary_weights_in_fp8": False,
+                # "primary_weights_in_fp8": False,
                 "ub_name": None,
             }
-            if TE_VERSION_1_3_PLUS:
-                kwargs["cpu_offloading"] = CPUOffloadEnabled
+            kwargs["cpu_offloading"] = CPUOffloadEnabled
             if TE_VERSION_1_6_PLUS:
                 kwargs.update(
                     {
                         # ref: https://github.com/NVIDIA/TransformerEngine/blame/7c1828f80edc1405d4ef1a7780c9e0046beab5c7/transformer_engine/pytorch/module/linear.py#L70
-                        "skip_fp8_weight_update": None,
+                        # "skip_fp8_weight_update": None,
                         # ref: https://github.com/NVIDIA/TransformerEngine/blame/7c1828f80edc1405d4ef1a7780c9e0046beab5c7/transformer_engine/pytorch/module/linear.py#L84-L85
                         "ub_overlap_rs": False,
                         "ub_overlap_ag": False,
@@ -320,7 +343,7 @@ def _te_functional_linear_backward_impl(
     # https://github.com/NVIDIA/TransformerEngine/blob/b957aa475bcbcf22405381d18bd7fefe4fb6b171/transformer_engine/pytorch/module/linear.py#L434
     with enable_grad(ctx.saved_tensors[2]):
         grads = _Linear.backward(ctx, g)
-    grad_inputs = (grads[3], grads[0], grads[4])
+    grad_inputs = (grads[2], grads[0], grads[3])
     return grad_inputs
 
 
