@@ -92,29 +92,30 @@ NON_COMPUTATION_PRIMS = (
 )
 
 
-def nvtx_profile_transform(trace: Trace, **kwargs) -> Trace:
-    with Timer() as timer:
-        profile_trace = from_trace(trace)
+class NvtxProfileTransform(thunder.core.transforms.PostOptimizationTransform):
+    def __call__(self, trace: Trace, **kwargs) -> Trace:
+        with Timer() as timer:
+            profile_trace = from_trace(trace)
 
-        # Start profiling
-        # profile_trace.bound_symbols.append(cuda_profiler_start.bind(output=None))
-        for bound_symbol in trace.bound_symbols:
-            # Synchronize and stop profiling at return.
-            if PrimIDs.RETURN == bound_symbol.sym.id:
-                # profile_trace.bound_symbols.append(cuda_profiler_stop.bind(output=None))
+            # Start profiling
+            # profile_trace.bound_symbols.append(cuda_profiler_start.bind(output=None))
+            for bound_symbol in trace.bound_symbols:
+                # Synchronize and stop profiling at return.
+                if PrimIDs.RETURN == bound_symbol.sym.id:
+                    # profile_trace.bound_symbols.append(cuda_profiler_stop.bind(output=None))
+                    profile_trace.bound_symbols.append(bound_symbol)
+                    break
+
+                if bound_symbol.sym.id in NON_COMPUTATION_PRIMS:
+                    # Just append the symbol.
+                    profile_trace.bound_symbols.append(bound_symbol)
+                    continue
+
+                profile_trace.bound_symbols.append(nvtx_push.bind(f"{bound_symbol.python(indent=0)}", output=None))
                 profile_trace.bound_symbols.append(bound_symbol)
-                break
+                profile_trace.bound_symbols.append(nvtx_pop.bind(output=None))
 
-            if bound_symbol.sym.id in NON_COMPUTATION_PRIMS:
-                # Just append the symbol.
-                profile_trace.bound_symbols.append(bound_symbol)
-                continue
-
-            profile_trace.bound_symbols.append(nvtx_push.bind(f"{bound_symbol.python(indent=0)}", output=None))
-            profile_trace.bound_symbols.append(bound_symbol)
-            profile_trace.bound_symbols.append(nvtx_pop.bind(output=None))
-
-    profile_trace.set_provenance(
-        TraceProvenance(f"Profile Transform (took {timer.get_elapsed_time_in_ms()} milliseconds)")
-    )
-    return profile_trace
+        profile_trace.set_provenance(
+            TraceProvenance(f"Profile Transform (took {timer.get_elapsed_time_in_ms()} milliseconds)")
+        )
+        return profile_trace

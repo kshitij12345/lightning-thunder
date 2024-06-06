@@ -17,8 +17,9 @@ if __name__ == "__main__":
     with device:
         model = GPT(config)
 
-    from profile_transform import nvtx_profile_transform
+    from profile_transform import NvtxProfileTransform
 
+    nvtx_profile_transform = NvtxProfileTransform()
     model = thunder.distributed.fsdp(model)
     model = thunder.jit(model, executors=["torch"], post_optimization_transforms=[nvtx_profile_transform])
 

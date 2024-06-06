@@ -23,11 +23,9 @@ x = torch.randn(4, dim, dim, device="cuda")
 # Transform for profiling with NVTX markers.
 # This transform adds NVTX markers to all the computation symbols in the execution trace.
 # It also marks the start and end of trace with cudaProfilerStart and cudaProfilerEnd to specify the capture range.
-from nvtx_profiler.profile_transform import (
-    nvtx_profile_transform,
-    nvtx_profiler_ex,
-    profile_with_nvtx,
-)
+from profile_transform import NvtxProfileTransform
+
+nvtx_profile_transform = NvtxProfileTransform()
 
 # import nvtx
 # profile = nvtx.Profile()
@@ -38,7 +36,7 @@ torch.cuda.cudart().cudaProfilerStart()
 jmodel = thunder.jit(
     model,
     post_optimization_transforms=[
-        # nvtx_profile_transform,
+        nvtx_profile_transform,
     ],
 )
 o = jmodel(x)
