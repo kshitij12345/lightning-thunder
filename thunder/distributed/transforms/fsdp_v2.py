@@ -3,6 +3,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from collections import defaultdict
 
 from thunder.core import devices
 from thunder.core import prims
@@ -27,6 +28,7 @@ __all__ = [
 class FSDPTraceTransform(EarlyTransform):
     sharded_params: dict[str, Any]
     process_group: ProcessGroup
+    shared_params_name: dict[str, str]
 
     def __call__(self, prologue_trace, computation_trace, epilogue_trace, **kwargs):
         from thunder.distributed import prims as dist_prims
@@ -47,6 +49,17 @@ class FSDPTraceTransform(EarlyTransform):
             raise NotImplementedError("original module does not match the compiled module")
 
         computation_trace.push_scope([])
+        shared_proxies_to_replace = defaultdict(list)
+
+        # Create a map from param_name to corresponding proxy.
+        # This is required as we track `shared_params` by the param_names.
+        param_name_to_proxies = {}
+        for pro_out_p in prologue_trace.output:
+            bsym = prologue_producers[pro_out_p]
+            if bsym.sym == prims.unpack_parameter:
+                param_thunder_module, param_name = bsym.args
+                assert param_thunder_module is thunder_module_proxy
+                param_name_to_proxies[param_name] = pro_out_p
 
         synchronized_parameters = []
         # todo: deal with epilogue output
@@ -56,6 +69,15 @@ class FSDPTraceTransform(EarlyTransform):
                 param_thunder_module, param_name = bsym.args
                 assert param_thunder_module is thunder_module_proxy
                 if param_name in self.sharded_params:
+
+                    # If the parameter is a shared parameter,
+                    # track it in shared_proxies_to_replace.
+                    if param_name in self.shared_params_name:
+                        mapped_name = self.shared_params_name[param_name]
+                        mapped_proxy = id(param_name_to_proxies[mapped_name])
+                        # proxy of the original param to corresponding inputs.
+                        shared_proxies_to_replace[mapped_proxy].append(comp_inp_p)
+
                     old_shape, new_shape, new_torch_device = self.sharded_params[param_name]
                     thunder_device = devices.to_device(new_torch_device)
                     thunder_device_str = str(thunder_device)
@@ -89,7 +111,19 @@ class FSDPTraceTransform(EarlyTransform):
                     a0, shape, _, *a2pp = bsym.args
                     bsym.args = (a0, shape, thunder_device_str, *a2pp)
 
-        proxies_to_replace = {id(bsym.args[0]): bsym.output for bsym in new_scope}
+        proxies_to_replace = {}
+
+        for bsym in new_scope:
+            input_id = id(bsym.args[0])
+            if input_id in proxies_to_replace:
+                continue
+
+            proxies_to_replace[input_id] = bsym.output
+            # If this is the original shared proxy,
+            # replace other params with this output.
+            if input_id in shared_proxies_to_replace.keys():
+                for proxy in shared_proxies_to_replace[input_id]:
+                    proxies_to_replace[id(proxy)] = bsym.output
 
         new_computation_trace = from_trace(computation_trace)
         for idx, bsym in enumerate(computation_trace.bound_symbols):

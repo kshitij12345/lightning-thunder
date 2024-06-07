@@ -616,6 +616,21 @@ def jit(
             else:
                 backward_fn = None
 
+            # import os
+            # LOCAL_RANK = int(os.environ["LOCAL_RANK"])
+            # if LOCAL_RANK == 0:
+            #     # print(torch.cuda.max_memory_allocated())
+            #     # pro_trace = thunder.last_prologue_traces(model)[-1]
+            #     pro_trace = prologue_trc
+            #     with open("weight_sharing_trace_pro.py", 'w') as f:
+            #         f.write(str(pro_trace))
+            #     trace = computation_trc
+            #     with open("weight_sharing_trace.py", 'w') as f:
+            #         f.write(str(trace))
+            #     bwd_trace = backward_trc
+            #     with open("weight_sharing_bwd_trace.py", 'w') as f:
+            #         f.write(str(bwd_trace))
+
             # TODO: using vanilla CUDAGraphExecutor is not safe unless the graph is always static!
             # (fixme): inspect torch.cuda.make_graph_callables and/or use it instead!
             # See https://github.com/Lightning-AI/lightning-thunder/issues/433

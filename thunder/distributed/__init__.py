@@ -453,6 +453,7 @@ def fsdp_transform_module(
     # Key to this dictionary is the original parameter from the user's Module.
     # Values are the copied and sharded parameter for the thunder module and meta-data related to sharding.
     shared_params = WeakTensorKeyDictionary()
+    shared_params_name = {}
     for module_name, _ in thunder_model._model.named_modules():
         submodule = thunder_model.get_submodule(module_name)
 
@@ -500,6 +501,8 @@ def fsdp_transform_module(
             # If there are shared params in the original user Module, we reuse the sharded copy created from the original parameter below.
             # This way we re-create parameter sharing in thunder's copy of the Module.
             if p in shared_params:
+                # Shared param names : current param - original param
+                shared_params_name[pn] = shared_params[p]["param_name"]
                 # Re-use the previous copy of this parameter.
                 thunder_model._overrides_parameters[pn] = shared_params[p]["param_copy"]
                 sharded_params[pn] = shared_params[p]["param_shard_meta"]
@@ -520,11 +523,13 @@ def fsdp_transform_module(
             shared_params[p] = {
                 "param_copy": thunder_model._overrides_parameters[pn],
                 "param_shard_meta": sharded_params[pn],
+                "param_name": pn,
             }
 
     early_transform_from_trace_to_fsdp_trace = FSDPTraceTransform(
         sharded_params=sharded_params,
         process_group=process_group,
+        shared_params_name=shared_params_name,
     )
     # add prologue + compute transform
     thunder_model = add_transform(thunder_model, early_transform=early_transform_from_trace_to_fsdp_trace)
