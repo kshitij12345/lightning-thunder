@@ -508,7 +508,7 @@ def add_post_optimization_transform(cfn: Callable, transform: PostOptimizationTr
 
 # The no-op transform. A trivial composable transform, only useful as an example.
 class _NoopTransform(AdditionalTransform):
-    def __call__(self, trace: Trace, **kwargs) -> Trace:
+    def transform_trace(self, trace: Trace, **kwargs) -> Trace:
         start_time_ns = time.time_ns()
         noop_trace = from_trace(trace)
 
@@ -1395,7 +1395,7 @@ def grad(
         return grad_func
 
     class _GradTransform(AdditionalTransform):
-        def __call__(self, trc: Trace, *, executors_list: Sequence[Any]) -> Trace:
+        def transform_trace(self, trc: Trace, *, executors_list: Sequence[Any]) -> Trace:
             # Using trc.python_callable() makes it impossible to retrace the
             # function because the python_callable uses python_ctx which replaces
             # symbol occurrences with its symbol._call_ctx function
@@ -3479,7 +3479,10 @@ def _update_forward_with_new_saved_for_backward(forward_trace: Trace, saved_for_
         saved_for_backward (Sequence[Variable]): Saved_for_backward to use to
             update the forward trace.
     """
-    saved_for_backward = tree_map(lambda x: x.value if isinstance(x, NumberProxy) else x, saved_for_backward)
+    forward_trace_producers = utils.producers(forward_trace)
+    saved_for_backward = tree_map(
+        lambda x: x.value if isinstance(x, NumberProxy) and x not in forward_trace_producers else x, saved_for_backward
+    )
     saved_tensors, saved_other = _split_saved_for_backward_into_tensors_and_other(saved_for_backward)
     assert forward_trace.bound_symbols[-1].sym.id == prims.PrimIDs.RETURN
     new_return = (forward_trace.output[0], (saved_tensors, saved_other))
