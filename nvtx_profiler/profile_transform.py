@@ -1,5 +1,4 @@
 from thunder.core.trace import TraceCtx as Trace, from_trace, TraceProvenance
-import thunder.core.prims as prims
 from thunder.core.prims import PrimIDs
 from thunder.extend import OperatorExecutor
 import time
@@ -21,13 +20,12 @@ class Timer:
 
     def get_elapsed_time_in_ms(self):
         elapsed_time_ns = self.end_time_ns - self.start_time_ns
-        return elapsed_time_ns // 1000000
+        return elapsed_time_ns // int(1e6)
 
 
 nvtx_profiler_ex = OperatorExecutor("nvtx_profiler_ex")
 
 
-# Symbols for profiling.
 def nvtx_push_impl(msg):
     torch.cuda.nvtx.range_push(msg)
 
@@ -36,24 +34,9 @@ def nvtx_pop_impl():
     torch.cuda.nvtx.range_pop()
 
 
-def profile_start_impl():
-    torch.cuda.cudart().cudaProfilerStart()
-
-
-def profile_stop_impl():
-    torch.cuda.synchronize()
-    torch.cuda.cudart().cudaProfilerStop()
-
-
-tags = (prims.OpTags.DONT_DCE,)
-nvtx_push = nvtx_profiler_ex.register_operator("nvtx_range_push", meta=lambda msg: None, fn=nvtx_push_impl, tags=tags)
-nvtx_pop = nvtx_profiler_ex.register_operator("nvtx_range_pop", meta=lambda: None, fn=nvtx_pop_impl, tags=tags)
-cuda_profiler_start = nvtx_profiler_ex.register_operator(
-    "cuda_profiler_start", meta=lambda: None, fn=profile_start_impl, tags=tags
-)
-cuda_profiler_stop = nvtx_profiler_ex.register_operator(
-    "cuda_profiler_stop", meta=lambda: None, fn=profile_stop_impl, tags=tags
-)
+# Symbols for profiling.
+nvtx_push = nvtx_profiler_ex.register_operator("nvtx_range_push", meta=lambda msg: None, fn=nvtx_push_impl)
+nvtx_pop = nvtx_profiler_ex.register_operator("nvtx_range_pop", meta=lambda: None, fn=nvtx_pop_impl)
 
 NON_COMPUTATION_PRIMS = (
     PrimIDs.ASSERT_TENSOR_METADATA,
@@ -89,33 +72,28 @@ NON_COMPUTATION_PRIMS = (
     PrimIDs.COMMENT,
     PrimIDs.DEL,
     PrimIDs.PRINT,
+    PrimIDs.RETURN,
 )
 
 
 class NvtxProfileTransform(thunder.core.transforms.PostOptimizationTransform):
-    def __call__(self, trace: Trace, **kwargs) -> Trace:
+    def transform_trace(self, trace: Trace, **kwargs) -> Trace:
         with Timer() as timer:
             profile_trace = from_trace(trace)
 
-            # Start profiling
-            # profile_trace.bound_symbols.append(cuda_profiler_start.bind(output=None))
             for bound_symbol in trace.bound_symbols:
-                # Synchronize and stop profiling at return.
-                if PrimIDs.RETURN == bound_symbol.sym.id:
-                    # profile_trace.bound_symbols.append(cuda_profiler_stop.bind(output=None))
-                    profile_trace.bound_symbols.append(bound_symbol)
-                    break
-
                 if bound_symbol.sym.id in NON_COMPUTATION_PRIMS:
-                    # Just append the symbol.
                     profile_trace.bound_symbols.append(bound_symbol)
                     continue
 
-                profile_trace.bound_symbols.append(nvtx_push.bind(f"{bound_symbol.python(indent=0)}", output=None))
+                # Add nvtx range for the symbol.
+                profile_trace.bound_symbols.append(
+                    nvtx_push.bind(f"{''.join(bound_symbol.python(indent=0))}", output=None)
+                )
                 profile_trace.bound_symbols.append(bound_symbol)
                 profile_trace.bound_symbols.append(nvtx_pop.bind(output=None))
 
         profile_trace.set_provenance(
-            TraceProvenance(f"Profile Transform (took {timer.get_elapsed_time_in_ms()} milliseconds)")
+            TraceProvenance(f"NVTX Profile Transform (took {timer.get_elapsed_time_in_ms()} milliseconds)")
         )
         return profile_trace
