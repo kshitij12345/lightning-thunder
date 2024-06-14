@@ -2,7 +2,15 @@ import math
 import os
 import sys
 from typing import ClassVar
+import multiprocessing as mp
+import sys
+import tempfile
+from functools import wraps
 
+from thunder.core import devices
+
+import pytest
+import torch.distributed as tdist
 import torch
 import torch.nn as nn
 
@@ -113,3 +121,91 @@ class DataParallelTestCase(common_distributed.MultiProcessTestCase):
             torch.distributed.barrier()
             torch.distributed.destroy_process_group()
         sys.exit(0)
+
+
+# Wraps a function so that it becomes one process of several executing the test
+#   See test_native_ddp and its helper _test_native_ddp_helper below for an example
+#   of how to use this wrapper.
+# NOTE This actually requires wrapping a stub, because the test framework manipulates
+#   functions in a way that does not allow them to be pickled.
+#   The actual logic must be implemented in a helper that can be pickled.
+# NOTE Tests wrapped with ddp_wrapper can be invoked directly, but you must invoke them
+#   like:
+#   if __name__ == '__main__':
+#       test_ddp.test_native_ddp_TorchEx_cpu_float32()
+class ddp_wrapper:
+    def __init__(self, name, fn):
+        self.fn = fn
+        self.__name__ = name
+
+    def __call__(self, test_stub):
+        if not tdist.is_available():
+            pytest.skip("This test requires torch.distributed be available")
+
+        # Creates a temporary file for process group discovery
+        FILE_SCHEMA: str = "file://"
+        if sys.platform == "win32":
+            FILE_SCHEMA = "file:///"
+        file_name = tempfile.NamedTemporaryFile(delete=False).name
+        init_method = f"{FILE_SCHEMA}{file_name}"
+
+        @wraps(test_stub)
+        def test_fn(executor, devices, dtype, **kwargs):
+            world_size = len(devices)
+            input_data = []
+
+            for rank in range(world_size):
+                process_data = (init_method, world_size, rank, executor, devices[rank], dtype, kwargs)
+                input_data.append(process_data)
+
+            ctx = mp.get_context("spawn")
+            pool = ctx.Pool(world_size)
+
+            def callback(result):
+                pass
+
+            def error_callback(ex):
+                # NOTE: Don't raise the exception here, because it will be
+                # raised in the main process. Raising it here will cause a
+                # deadlock.
+                pass
+
+            # The seconds to wait before the pool tasks complete
+            TIMEOUT: int = 30
+            try:
+                results_future = pool.map_async(self.fn, input_data, 1, callback, error_callback)
+                results = results_future.get(TIMEOUT)
+            finally:
+                pool.close()
+                pool.join()
+
+            # Raises the first assertion if any occurred
+            root_results = results[0]
+            if len(root_results) > 0:
+                raise (root_results[0])
+
+        return test_fn
+
+
+# Configures PyTorch's default process group, must be called at the start of each
+#   distributed process
+def init_per_process_distributed(
+    init_method: str, devicetype: devices.DeviceType, world_size: int, rank: int
+) -> tdist.ProcessGroup:
+    backend: str
+    if devicetype is devices.DeviceType.CUDA:
+        backend = "nccl"
+    elif devicetype is devices.DeviceType.CPU:
+        backend = "gloo"
+    else:
+        raise ValueError(f"Unknown devicetype {devicetype}")
+
+    tdist.init_process_group(init_method=init_method, backend=backend, world_size=world_size, rank=rank)
+
+    # NOTE _get_default_group is not a public PyTorch function, but there is no
+    #   public mechanism to acquire the default process group, which is specified
+    #   in operations by setting process_group=None.
+    #   Actually acquiring the default ProcessGroup is not typically necessary, but
+    #   thunder doesn't like to model primitives with implicit defaults,
+    #   so we want to pass the ProcessGroup explicitly
+    return tdist.distributed_c10d._get_default_group()
