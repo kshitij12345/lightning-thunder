@@ -49,27 +49,12 @@ def sync_stream_impl():
 sync_stream = offload_exec.register_operator("sync_stream", meta=lambda: None, fn=sync_stream_impl)
 
 
-def get_symbols_to_last_used_variables(symbols, ignore, first_used=False):
-    """Get a mapping from symbols to the last used variables.
-
-    Mark last used intermediates to be deleted. This is necessary to avoid memory leaks.
-
-    Args:
-        symbols: list of symbols
-        ignore: list of variables to be ignored, they will not be marked as last used
-
-    Returns:
-        dict: mapping from symbols to the last used variables
-    """
-    ignore = (ignore,) if not isinstance(ignore, Sequence) else ignore
-    ignore = tree_flatten(ignore)[0]
+def _get_symbols_to_last_or_first_used_variables(symbols, first_used=False):
     variable_to_last_symbol = {}
     symbol_to_last_variables = {}
     symbol_to_idx = {sym: idx for idx, sym in enumerate(symbols)}
 
     def _mark_last_use(symbol, variable):
-        if variable in ignore:
-            return
         if not variable in variable_to_last_symbol:
             variable_to_last_symbol[variable] = symbol
             symbol_to_last_variables.setdefault(symbol, []).append(variable)
@@ -87,7 +72,15 @@ def get_symbols_to_last_used_variables(symbols, ignore, first_used=False):
     return symbol_to_last_variables, variable_to_last_symbol, symbol_to_idx
 
 
-def move_loads_closer_to_consumer(execution_trace):
+def get_symbols_to_last_used_variables(symbols):
+    return _get_symbols_to_last_or_first_used_variables(symbols)
+
+
+def get_symbols_to_first_used_variables(symbols):
+    return _get_symbols_to_last_or_first_used_variables(symbols, first_used=True)
+
+
+def move_loads_closer_to_computation_consumer(execution_trace):
     new_execution_trace = from_trace(execution_trace)
 
     compute_producers, compute_consumers = thunder.core.utils.producers_and_consumers(execution_trace)
@@ -125,6 +118,7 @@ class CPUOffloading(Transform):
     def __init__(self):
         self.forward_pass = None
         self.backward_pass = None
+        self._offloaded_tensors = ()
 
     def _get_tensors_to_offload(self, forward_trace):
         return_bsym = forward_trace.bound_symbols[-1]
@@ -165,8 +159,8 @@ class CPUOffloading(Transform):
         # We offload saved tensors which are not arguments to the computation trace and are saved for backwards.
         tensors_to_offload = self._get_tensors_to_offload(computation_trace)
         _, variable_to_last_symbol, symbol_to_idx = get_symbols_to_last_used_variables(
-            computation_trace.bound_symbols[:-1], ()
-        )
+            computation_trace.bound_symbols[:-1]
+        )  # Ignore the return statement.
 
         # Insert the offloading calls after the last use of the saved tensor (which we want to offload).
 
@@ -212,8 +206,8 @@ class CPUOffloading(Transform):
         if len(offloaded_tensors) == 0:
             return computation_trace
 
-        _, variable_to_first_symbol, symbol_to_idx = get_symbols_to_last_used_variables(
-            computation_trace.bound_symbols, (), first_used=True
+        _, variable_to_first_symbol, symbol_to_idx = get_symbols_to_first_used_variables(
+            computation_trace.bound_symbols
         )
 
         for t in offloaded_tensors.keys():
@@ -235,8 +229,8 @@ class CPUOffloading(Transform):
         computation_trace.bound_symbols[offset] = new_unpack_bsym
 
         offset = offset + 1
-        _, variable_to_first_symbol, symbol_to_idx = get_symbols_to_last_used_variables(
-            computation_trace.bound_symbols[offset:], (), first_used=True
+        _, variable_to_first_symbol, symbol_to_idx = get_symbols_to_first_used_variables(
+            computation_trace.bound_symbols[offset:]
         )
 
         # Load to GPU before usage.
@@ -273,7 +267,7 @@ class CPUOffloading(Transform):
             # a reshape or permute op and the actual computation occurs 50-100 lines later.
             # Because of this we load more tensors than required eagerly (thus decreasing the memory gains from CPU Offloading).
             # This function is currently tailored to pattern observed in Llama-2
-            computation_trace = move_loads_closer_to_consumer(computation_trace)
+            computation_trace = move_loads_closer_to_computation_consumer(computation_trace)
 
         return computation_trace
 
