@@ -203,19 +203,22 @@ class CPUOffloading(Transform):
         offloaded_tensors = self._offloaded_tensors
         offloaded_tensors_dev_map = self._offloaded_tensors_dev
 
-        if len(offloaded_tensors) == 0:
-            return computation_trace
+        # compute_producers, compute_consumers = thunder.core.utils.producers_and_consumers(computation_trace)
 
+        # We want to insert `loads` before the first use of offloaded_tensors.
         _, variable_to_first_symbol, symbol_to_idx = get_symbols_to_first_used_variables(
             computation_trace.bound_symbols
         )
 
+        # This is just a dance to find `unpack` collection - which is the first reference to offloaded tensor.
+        # TODO - Do it without this symbol_to_first dance.
         for t in offloaded_tensors.keys():
             pass
         symbol_to_idx[variable_to_first_symbol[t]]
 
         offset = symbol_to_idx[variable_to_first_symbol[t]]
-        # Unpack Collection
+        # Unpack Collection - update unpack collection so that it
+        # outputs the offloaded tensor proxies (not the original ones).
         unpack_sym = variable_to_first_symbol[t]
         unpack_sym_out = unpack_sym.output
         new_out = []
@@ -228,12 +231,14 @@ class CPUOffloading(Transform):
         new_unpack_bsym = BoundSymbol.from_bsym(unpack_sym, output=tuple(new_out))
         computation_trace.bound_symbols[offset] = new_unpack_bsym
 
+        # Now we again find the first usages of offloaded tensor
+        # This will actually point us to the first consumer of the offloaded tensor.
         offset = offset + 1
         _, variable_to_first_symbol, symbol_to_idx = get_symbols_to_first_used_variables(
             computation_trace.bound_symbols[offset:]
         )
 
-        # Load to GPU before usage.
+        # Load the offloaded tensors to GPU before usage.
         # Should iterate in correct order (else it would be problematic).
         for idx, (vt, offloaded_t) in enumerate(
             sorted(offloaded_tensors.items(), key=lambda kv: symbol_to_idx[variable_to_first_symbol[kv[0]]])
@@ -242,11 +247,13 @@ class CPUOffloading(Transform):
             first_used_symbol_idx = symbol_to_idx[first_used_symbol]
             t = vt.proxy
             device = offloaded_tensors_dev_map[vt]
+
             with tracectx(computation_trace):
                 new_sym = load_to_gpu.bind(offloaded_t, device, output=t)
             new_sym.header = "Created by CPU Offloading Transform"
             computation_trace.bound_symbols.insert(offset + first_used_symbol_idx + idx, new_sym)
 
+        # Don't forget to add `CUDA sync` as the first symbol to the trace.
         # Sync streams between forward and backward (as we offload on different stream).
         sync_bsym = sync_stream.bind(output=None)
         sync_bsym.header = "Inserted by CPU Offloading"
@@ -261,6 +268,10 @@ class CPUOffloading(Transform):
             if "augmented_forward" in computation_trace.fn.__name__:
                 computation_trace = self._offload_tensors_from_forward(computation_trace)
         else:
+            # Skip if no tensor was offloaded.
+            if len(self._offloaded_tensors) == 0:
+                return computation_trace
+
             computation_trace = self._load_tensors_for_backward(computation_trace)
 
             # We need this because in unmodified backward trace, the first consumer of saved_for_backward maybe
