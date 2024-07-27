@@ -52,7 +52,6 @@ sync_stream = offload_exec.register_operator("sync_stream", meta=lambda: None, f
 def _get_symbols_to_last_or_first_used_variables(symbols, first_used=False):
     variable_to_last_symbol = {}
     symbol_to_last_variables = {}
-    symbol_to_idx = {sym: idx for idx, sym in enumerate(symbols)}
 
     def _mark_last_use(symbol, variable):
         if not variable in variable_to_last_symbol:
@@ -69,7 +68,7 @@ def _get_symbols_to_last_or_first_used_variables(symbols, first_used=False):
             variables = (symbol.flat_variableified_proxy_args) + tuple(symbol.flat_variableified_proxy_outs)
         tree_map(lambda x: _mark_last_use(symbol, x), variables)
 
-    return symbol_to_last_variables, variable_to_last_symbol, symbol_to_idx
+    return symbol_to_last_variables, variable_to_last_symbol
 
 
 def get_symbols_to_last_used_variables(symbols):
@@ -80,13 +79,17 @@ def get_symbols_to_first_used_variables(symbols):
     return _get_symbols_to_last_or_first_used_variables(symbols, first_used=True)
 
 
+def get_symbol_to_idx(symbols):
+    return {sym: idx for idx, sym in enumerate(symbols)}
+
+
 def move_loads_closer_to_computation_consumer(execution_trace):
     new_execution_trace = from_trace(execution_trace)
 
     compute_producers, compute_consumers = thunder.core.utils.producers_and_consumers(execution_trace)
 
     bsyms = execution_trace.bound_symbols
-    symbol_to_idx = {sym: idx for idx, sym in enumerate(bsyms)}
+    symbol_to_idx = get_symbol_to_idx(bsyms)
     idx_to_swap = {}
     symbols_to_swap = {}
     for idx, bound_symbol in enumerate(bsyms):
@@ -101,8 +104,6 @@ def move_loads_closer_to_computation_consumer(execution_trace):
 
     new_bsyms = [bsym for bsym in bsyms]
     for symbol, consumer_symbol in symbols_to_swap.items():
-        # print(symbol)
-        # print(consumer_symbol)
         symbol_to_idx = {sym: idx for idx, sym in enumerate(new_bsyms)}
         curr_idx = symbol_to_idx[symbol]
         consumer_idx = symbol_to_idx[consumer_symbol]
@@ -158,9 +159,11 @@ class CPUOffloading(Transform):
         # Find the tensors to offload.
         # We offload saved tensors which are not arguments to the computation trace and are saved for backwards.
         tensors_to_offload = self._get_tensors_to_offload(computation_trace)
-        _, variable_to_last_symbol, symbol_to_idx = get_symbols_to_last_used_variables(
+        _, variable_to_last_symbol = get_symbols_to_last_used_variables(
             computation_trace.bound_symbols[:-1]
         )  # Ignore the return statement.
+
+        symbol_to_idx = get_symbol_to_idx(computation_trace.bound_symbols)
 
         # Insert the offloading calls after the last use of the saved tensor (which we want to offload).
 
@@ -203,12 +206,12 @@ class CPUOffloading(Transform):
         offloaded_tensors = self._offloaded_tensors
         offloaded_tensors_dev_map = self._offloaded_tensors_dev
 
-        # compute_producers, compute_consumers = thunder.core.utils.producers_and_consumers(computation_trace)
+        compute_producers, compute_consumers = thunder.core.utils.producers_and_consumers(computation_trace)
 
         # We want to insert `loads` before the first use of offloaded_tensors.
-        _, variable_to_first_symbol, symbol_to_idx = get_symbols_to_first_used_variables(
-            computation_trace.bound_symbols
-        )
+        _, variable_to_first_symbol = get_symbols_to_first_used_variables(computation_trace.bound_symbols)
+
+        symbol_to_idx = get_symbol_to_idx(computation_trace.bound_symbols)
 
         # This is just a dance to find `unpack` collection - which is the first reference to offloaded tensor.
         # TODO - Do it without this symbol_to_first dance.
@@ -234,9 +237,7 @@ class CPUOffloading(Transform):
         # Now we again find the first usages of offloaded tensor
         # This will actually point us to the first consumer of the offloaded tensor.
         offset = offset + 1
-        _, variable_to_first_symbol, symbol_to_idx = get_symbols_to_first_used_variables(
-            computation_trace.bound_symbols[offset:]
-        )
+        _, variable_to_first_symbol = get_symbols_to_first_used_variables(computation_trace.bound_symbols[offset:])
 
         # Load the offloaded tensors to GPU before usage.
         # Should iterate in correct order (else it would be problematic).
@@ -251,7 +252,7 @@ class CPUOffloading(Transform):
             with tracectx(computation_trace):
                 new_sym = load_to_gpu.bind(offloaded_t, device, output=t)
             new_sym.header = "Created by CPU Offloading Transform"
-            computation_trace.bound_symbols.insert(offset + first_used_symbol_idx + idx, new_sym)
+            computation_trace.bound_symbols.insert(first_used_symbol_idx + idx, new_sym)
 
         # Don't forget to add `CUDA sync` as the first symbol to the trace.
         # Sync streams between forward and backward (as we offload on different stream).
