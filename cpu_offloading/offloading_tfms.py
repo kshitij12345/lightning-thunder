@@ -168,91 +168,112 @@ class CPUOffloading(Transform):
             computation_trace.bound_symbols[:-1], ()
         )
 
-        # Insert the offloading calls after the last use of the saved tensor.
+        # Insert the offloading calls after the last use of the saved tensor (which we want to offload).
+
+        # Book keeping for backward pass update.
         new_output_map = {}
         new_output_dev_map = {}
-        for idx, t in enumerate(
-            sorted(tensors_to_offload, key=lambda t: symbol_to_idx[variable_to_last_symbol[variableify(t)]])
-        ):
+
+        # Since we are inserting in the list (we need to obey increasing order) - else the insertions will be incorrect.
+        sorted_tensors_to_offload = sorted(
+            tensors_to_offload, key=lambda t: symbol_to_idx[variable_to_last_symbol[variableify(t)]]
+        )
+        for idx, t in enumerate(sorted_tensors_to_offload):
             last_used_symbol = variable_to_last_symbol[variableify(t)]
             last_used_symbol_idx = symbol_to_idx[last_used_symbol]
-
             computation_trace.push_scope([])
             with tracectx(computation_trace):
                 o = offload_to_cpu(t)
                 prims.python_del(t)
             scoped_comp = computation_trace.pop_scope()
             scoped_comp[0].header = "Created by CPU Offloading Transform"
-            # print(scoped_comp)
+
+            # This will insert `del` first and then push it down when we insert `offload_to_cpu`.
             computation_trace.bound_symbols.insert(last_used_symbol_idx + 1 + (idx * 2), scoped_comp[1])
             computation_trace.bound_symbols.insert(last_used_symbol_idx + 1 + (idx * 2), scoped_comp[0])
 
+            # Update book keeping.
             new_output_map[variableify(t)] = o
             new_output_dev_map[variableify(t)] = t.device.device_str()
 
+        # Update the return symbol to return our offloaded tensors in saved for backward.
         self._replace_saved_tensors(computation_trace, new_output_map)
+
+        # Book keeping for backward pass update.
         self._offloaded_tensors = new_output_map
         self._offloaded_tensors_dev = new_output_dev_map
+        return computation_trace
+
+    def _load_tensors_for_backward(self, computation_trace):
+        self.backward_pass = computation_trace
+        offloaded_tensors = self._offloaded_tensors
+        offloaded_tensors_dev_map = self._offloaded_tensors_dev
+
+        if len(offloaded_tensors) == 0:
+            return computation_trace
+
+        _, variable_to_first_symbol, symbol_to_idx = get_symbols_to_last_used_variables(
+            computation_trace.bound_symbols, (), first_used=True
+        )
+
+        for t in offloaded_tensors.keys():
+            pass
+        symbol_to_idx[variable_to_first_symbol[t]]
+
+        offset = symbol_to_idx[variable_to_first_symbol[t]]
+        # Unpack Collection
+        unpack_sym = variable_to_first_symbol[t]
+        unpack_sym_out = unpack_sym.output
+        new_out = []
+        for out in unpack_sym_out:
+            vout = variableify(out)
+            if vout in offloaded_tensors:
+                new_out.append(offloaded_tensors[vout])
+            else:
+                new_out.append(out)
+        new_unpack_bsym = BoundSymbol.from_bsym(unpack_sym, output=tuple(new_out))
+        computation_trace.bound_symbols[offset] = new_unpack_bsym
+
+        offset = offset + 1
+        _, variable_to_first_symbol, symbol_to_idx = get_symbols_to_last_used_variables(
+            computation_trace.bound_symbols[offset:], (), first_used=True
+        )
+
+        # Load to GPU before usage.
+        # Should iterate in correct order (else it would be problematic).
+        for idx, (vt, offloaded_t) in enumerate(
+            sorted(offloaded_tensors.items(), key=lambda kv: symbol_to_idx[variable_to_first_symbol[kv[0]]])
+        ):
+            first_used_symbol = variable_to_first_symbol[vt]
+            first_used_symbol_idx = symbol_to_idx[first_used_symbol]
+            t = vt.proxy
+            device = offloaded_tensors_dev_map[vt]
+            with tracectx(computation_trace):
+                new_sym = load_to_gpu.bind(offloaded_t, device, output=t)
+            new_sym.header = "Created by CPU Offloading Transform"
+            computation_trace.bound_symbols.insert(offset + first_used_symbol_idx + idx, new_sym)
+
+        # Sync streams between forward and backward (as we offload on different stream).
+        sync_bsym = sync_stream.bind(output=None)
+        sync_bsym.header = "Inserted by CPU Offloading"
+        computation_trace.bound_symbols.insert(0, sync_bsym)
+
+        return computation_trace
 
     def transform_trace_post_optimization(self, computation_trace: thunder.TraceCtx, **kwargs):
         if self.forward_pass is None:
             self.forward_pass = computation_trace
-            # Processing for the forward pass.
+            # Processing for the forward pass (only if we are going to compute backward).
             if "augmented_forward" in computation_trace.fn.__name__:
-                self._offload_tensors_from_forward(computation_trace)
+                computation_trace = self._offload_tensors_from_forward(computation_trace)
         else:
-            self.backward_pass = computation_trace
-            offloaded_tensors = self._offloaded_tensors
-            offloaded_tensors_dev_map = self._offloaded_tensors_dev
+            computation_trace = self._load_tensors_for_backward(computation_trace)
 
-            if len(offloaded_tensors) == 0:
-                return computation_trace
-
-            _, variable_to_first_symbol, symbol_to_idx = get_symbols_to_last_used_variables(
-                computation_trace.bound_symbols, (), first_used=True
-            )
-
-            for t in offloaded_tensors.keys():
-                pass
-            symbol_to_idx[variable_to_first_symbol[t]]
-
-            offset = symbol_to_idx[variable_to_first_symbol[t]]
-            # Unpack Collection
-            unpack_sym = variable_to_first_symbol[t]
-            unpack_sym_out = unpack_sym.output
-            new_out = []
-            for out in unpack_sym_out:
-                vout = variableify(out)
-                if vout in offloaded_tensors:
-                    new_out.append(offloaded_tensors[vout])
-                else:
-                    new_out.append(out)
-            new_unpack_bsym = BoundSymbol.from_bsym(unpack_sym, output=tuple(new_out))
-            computation_trace.bound_symbols[offset] = new_unpack_bsym
-
-            offset = offset + 1
-            _, variable_to_first_symbol, symbol_to_idx = get_symbols_to_last_used_variables(
-                computation_trace.bound_symbols[offset:], (), first_used=True
-            )
-
-            # Load to GPU before usage.
-            # Should iterate in correct order (else it would be problematic).
-            for idx, (vt, offloaded_t) in enumerate(
-                sorted(offloaded_tensors.items(), key=lambda kv: symbol_to_idx[variable_to_first_symbol[kv[0]]])
-            ):
-                first_used_symbol = variable_to_first_symbol[vt]
-                first_used_symbol_idx = symbol_to_idx[first_used_symbol]
-                t = vt.proxy
-                device = offloaded_tensors_dev_map[vt]
-                with tracectx(computation_trace):
-                    new_sym = load_to_gpu.bind(offloaded_t, device, output=t)
-                new_sym.header = "Created by CPU Offloading Transform"
-                computation_trace.bound_symbols.insert(offset + first_used_symbol_idx + idx, new_sym)
-
+            # We need this because in unmodified backward trace, the first consumer of saved_for_backward maybe
+            # a reshape or permute op and the actual computation occurs 50-100 lines later.
+            # Because of this we load more tensors than required eagerly (thus decreasing the memory gains from CPU Offloading).
+            # This function is currently tailored to pattern observed in Llama-2
             computation_trace = move_loads_closer_to_consumer(computation_trace)
-            sync_bsym = sync_stream.bind(output=None)
-            sync_bsym.header = "Inserted by CPU Offloading"
-            computation_trace.bound_symbols.insert(0, sync_bsym)
 
         return computation_trace
 
