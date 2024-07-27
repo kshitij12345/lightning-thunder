@@ -90,7 +90,6 @@ def move_loads_closer_to_computation_consumer(execution_trace):
 
     bsyms = execution_trace.bound_symbols
     symbol_to_idx = get_symbol_to_idx(bsyms)
-    idx_to_swap = {}
     symbols_to_swap = {}
     for idx, bound_symbol in enumerate(bsyms):
         if (
@@ -98,16 +97,23 @@ def move_loads_closer_to_computation_consumer(execution_trace):
             and (bsyms[idx + 1].sym.id) in ("reshape", "permute")
             and bsyms[idx + 2].sym.id == prims.PrimIDs.DEL
         ):
-            consumer_idx = symbol_to_idx[compute_consumers[bsyms[idx + 1].output][0]]
-            idx_to_swap[idx] = consumer_idx
-            symbols_to_swap[bound_symbol] = compute_consumers[bsyms[idx + 1].output][0]
+            # Assumes the first to be the first consumer in trace.
+            first_consumer = compute_consumers[bsyms[idx + 1].output][0]
+            symbols_to_swap[bound_symbol] = first_consumer
+
+    # Move the loading of tensor - right above the consumer.
+    # We move
+    # 1. t = load_to_gpu(offloaded_t)
+    # 2. t1 = Permute(t) or reshape(t)
+    # 3. del t
+    NUM_SYMS_TO_MOVE = 3
 
     new_bsyms = [bsym for bsym in bsyms]
     for symbol, consumer_symbol in symbols_to_swap.items():
         symbol_to_idx = {sym: idx for idx, sym in enumerate(new_bsyms)}
         curr_idx = symbol_to_idx[symbol]
         consumer_idx = symbol_to_idx[consumer_symbol]
-        for _ in range(3):
+        for _ in range(NUM_SYMS_TO_MOVE):
             symbol_being_updated = new_bsyms.pop(curr_idx)
             new_bsyms.insert(consumer_idx - 1, symbol_being_updated)
 
@@ -213,16 +219,10 @@ class CPUOffloading(Transform):
 
         symbol_to_idx = get_symbol_to_idx(computation_trace.bound_symbols)
 
-        # This is just a dance to find `unpack` collection - which is the first reference to offloaded tensor.
-        # TODO - Do it without this symbol_to_first dance.
-        for t in offloaded_tensors.keys():
-            pass
-        symbol_to_idx[variable_to_first_symbol[t]]
-
-        offset = symbol_to_idx[variable_to_first_symbol[t]]
-        # Unpack Collection - update unpack collection so that it
+        # Update unpack collection so that it
         # outputs the offloaded tensor proxies (not the original ones).
-        unpack_sym = variable_to_first_symbol[t]
+        unpack_sym = compute_producers[list(offloaded_tensors.keys())[0].proxy]
+        unpack_idx = symbol_to_idx[unpack_sym]
         unpack_sym_out = unpack_sym.output
         new_out = []
         for out in unpack_sym_out:
@@ -232,11 +232,11 @@ class CPUOffloading(Transform):
             else:
                 new_out.append(out)
         new_unpack_bsym = BoundSymbol.from_bsym(unpack_sym, output=tuple(new_out))
-        computation_trace.bound_symbols[offset] = new_unpack_bsym
+        computation_trace.bound_symbols[unpack_idx] = new_unpack_bsym
 
         # Now we again find the first usages of offloaded tensor
         # This will actually point us to the first consumer of the offloaded tensor.
-        offset = offset + 1
+        offset = unpack_idx + 1
         _, variable_to_first_symbol = get_symbols_to_first_used_variables(computation_trace.bound_symbols[offset:])
 
         # Load the offloaded tensors to GPU before usage.
