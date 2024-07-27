@@ -108,6 +108,7 @@ def move_loads_closer_to_computation_consumer(execution_trace):
     # 3. del t
     NUM_SYMS_TO_MOVE = 3
 
+    # This is not optimal (and we should probably do something smarter here for swapping).
     new_bsyms = [bsym for bsym in bsyms]
     for symbol, consumer_symbol in symbols_to_swap.items():
         symbol_to_idx = {sym: idx for idx, sym in enumerate(new_bsyms)}
@@ -276,9 +277,20 @@ class CPUOffloading(Transform):
             computation_trace = self._load_tensors_for_backward(computation_trace)
 
             # We need this because in unmodified backward trace, the first consumer of saved_for_backward maybe
-            # a reshape or permute op and the actual computation occurs 50-100 lines later.
+            # a reshape or permute op and the actual computation occurs 50-100 (or more) lines later.
             # Because of this we load more tensors than required eagerly (thus decreasing the memory gains from CPU Offloading).
             # This function is currently tailored to pattern observed in Llama-2
+            # Eg. on line 92
+            #   # Created by CPU Offloading Transform
+            #   t1319 = load_to_gpu(offloaded_t1319, 'cuda:0')  # t1319: "cuda:0 f32[8, 1024, 11008]"
+            #   t4021 = torch.reshape(t1319, (-1, 11008))  # t4021: "cuda:0 f32[8192, 11008]"
+            #     # t4021 = ltorch.reshape(t1319, (-1, 11008))  # t4021: "cuda:0 f32[8192, 11008]"
+            #       # t4021 = prims.reshape(t1319, (8192, 11008))  # t4021: "cuda:0 f32[8192, 11008]"
+            #   del t1319
+            # And it's usage in computation is at 612
+            # t4022 = torch.matmul(t4020, t4021)  # t4022: "cuda:0 f32[4096, 11008]"
+            #   t4022 = ltorch.matmul(t4020, t4021)  # t4022: "cuda:0 f32[4096, 11008]"
+            #     t4022 = prims.matmul(t4020, t4021)  # t4022: "cuda:0 f32[4096, 11008]"
             computation_trace = move_loads_closer_to_computation_consumer(computation_trace)
 
         return computation_trace
