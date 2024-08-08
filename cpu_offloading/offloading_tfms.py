@@ -14,13 +14,13 @@ import torch
 
 offload_exec = OperatorExecutor("offload_exec")
 
-offload_stream = torch.cuda.Stream()
+offload_onload_stream = torch.cuda.Stream()
 
 
 def offload_to_cpu_impl(t):
     cuda = torch.device(t.device)
-    offload_stream.wait_stream(torch.cuda.default_stream(cuda))
-    with torch.cuda.stream(offload_stream):
+    offload_onload_stream.wait_stream(torch.cuda.default_stream(cuda))
+    with torch.cuda.stream(offload_onload_stream):
         return t.to("cpu")
 
 
@@ -32,7 +32,8 @@ offload_to_cpu = offload_exec.register_operator(
 
 
 def load_to_gpu_impl(t, device):
-    return t.to(device)
+    with torch.cuda.stream(offload_onload_stream):
+        return t.to(device)
 
 
 load_to_gpu = offload_exec.register_operator(
@@ -40,6 +41,16 @@ load_to_gpu = offload_exec.register_operator(
     meta=lambda t, device: TensorProxy(like=t, device=thunder.core.devices.Device(device)),
     fn=load_to_gpu_impl,
 )
+
+
+def wait_till_load_impl(t):
+    cuda = torch.device(t.device)
+    t.record_stream(torch.cuda.default_stream(cuda))
+    torch.cuda.default_stream(cuda).wait_stream(offload_onload_stream)
+    return t
+
+
+wait_till_load = offload_exec.register_operator("wait_till_load", meta=lambda t: t, fn=wait_till_load_impl)
 
 
 def sync_stream_impl():
@@ -106,7 +117,7 @@ def move_loads_closer_to_computation_consumer(execution_trace):
     # 1. t = load_to_gpu(offloaded_t)
     # 2. t1 = Permute(t) or reshape(t)
     # 3. del t
-    NUM_SYMS_TO_MOVE = 3
+    NUM_SYMS_TO_MOVE = 4
 
     # This is not optimal (and we should probably do something smarter here for swapping).
     new_bsyms = [bsym for bsym in bsyms]
@@ -252,7 +263,9 @@ class CPUOffloading(Transform):
 
             with tracectx(computation_trace):
                 new_sym = load_to_gpu.bind(offloaded_t, device, output=t)
+                new_wait_sym = wait_till_load.bind(t, output=t)
             new_sym.header = "Created by CPU Offloading Transform"
+            computation_trace.bound_symbols.insert(first_used_symbol_idx + idx, new_wait_sym)
             computation_trace.bound_symbols.insert(first_used_symbol_idx + idx, new_sym)
 
         # Don't forget to add `CUDA sync` as the first symbol to the trace.
@@ -296,34 +309,48 @@ class CPUOffloading(Transform):
         return computation_trace
 
 
-dim = 2048
+# dim = 2048
 
 
-class Model(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fc1 = torch.nn.Linear(dim, dim)
-        self.fc2 = torch.nn.Linear(dim, dim)
+# class Model(torch.nn.Module):
+#     def __init__(self):
+#         super().__init__()
+#         self.fc1 = torch.nn.Linear(dim, dim)
+#         self.fc2 = torch.nn.Linear(dim, dim)
 
-    def forward(self, x):
-        x = self.fc1(x)
-        x = torch.nn.functional.relu(x)
-        x = self.fc2(x)
-        return x
+#     def forward(self, x):
+#         x = self.fc1(x)
+#         x = torch.nn.functional.relu(x)
+#         x = self.fc2(x)
+#         return x
 
 
-with torch.device("cuda"):
-    model = Model()
-    x = torch.randn(dim, dim)
-    args = (x,)
-    kwargs = {}
+# with torch.device("cuda"):
+#     model = Model()
+#     x = torch.randn(dim, dim)
+#     args = (x,)
+#     kwargs = {}
+
+
+def benchmark(model, args, kwargs):
+    import time
+
+    torch.cuda.synchronize()
+    start = time.time_ns()
+    for _ in range(10):
+        e = model(*args, **kwargs)
+        _ = torch.autograd.grad(e, model.parameters(), g)
+    torch.cuda.synchronize()
+    end = time.time_ns()
+    print(f"It took {(end - start) / 1e6} ms!")
+
 
 from thunder.benchmarks.targets import LitGPTConfig, LitGPTBenchmark
 
 with torch.device("cuda"):
     cfg: LitGPTConfig = LitGPTConfig.from_name("Llama-2-7b-hf")
     cfg.n_layer = 10
-    cfg.block_size = 1024
+    cfg.block_size = 512
     b = LitGPTBenchmark(cfg)
     model = b.fn()
     args, kwargs = b.make_batch()
@@ -333,12 +360,24 @@ print(torch.cuda.max_memory_allocated() / 1e9)
 jmodel = thunder.jit(model, transforms=[offload_tfms])
 # jmodel = thunder.jit(model)
 
-o = jmodel(*args, **kwargs)
+a = jmodel(*args, **kwargs)
 print(torch.cuda.max_memory_allocated() / 1e9)
 
-o.sum().backward()
+g = torch.rand_like(a) / a.numel()
+actual_grads = torch.autograd.grad(a, model.parameters(), g)
 
 print(torch.cuda.max_memory_allocated() / 1e9)
+
+clone_arg = args[0].detach().clone()
+e = model(clone_arg)
+
+expected_grads = torch.autograd.grad(e, model.parameters(), g)
+torch.testing.assert_close(a, e)
+torch.testing.assert_close(actual_grads, expected_grads)
+
+benchmark(jmodel, args, kwargs)
+benchmark(model, (clone_arg,), kwargs)
+
 # print(thunder.last_backward_traces(jmodel)[-1])
 
 # 5 Layer
