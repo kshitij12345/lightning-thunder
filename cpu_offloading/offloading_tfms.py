@@ -31,9 +31,13 @@ offload_to_cpu = offload_exec.register_operator(
 )
 
 
+# def load_to_gpu_impl(t, device):
+#     with torch.cuda.stream(offload_onload_stream):
+#         return t.to(device)
+
+
 def load_to_gpu_impl(t, device):
-    with torch.cuda.stream(offload_onload_stream):
-        return t.to(device)
+    return t.to(device)
 
 
 load_to_gpu = offload_exec.register_operator(
@@ -161,10 +165,14 @@ def move_closer_to_consumer(execution_trace):
 
 
 class CPUOffloading(Transform):
-    def __init__(self):
+    def __init__(self, save_tensor_policy=None):
         self.forward_pass = None
         self.backward_pass = None
         self._offloaded_tensors = ()
+        self.save_tensor_policy = None
+        if save_tensor_policy is not None:
+            assert callable(save_tensor_policy)
+            self.save_tensor_policy = save_tensor_policy
 
     def _get_tensors_to_offload(self, forward_trace):
         return_bsym = forward_trace.bound_symbols[-1]
@@ -181,7 +189,10 @@ class CPUOffloading(Transform):
 
         # Tensors which are intermediate and not argument to the computation trace are
         # the ones we are interested in offloading.
-        self.tensors_to_offload = tuple(t for t in saved_tensors if ((not is_in_tensor_args(t)) and is_cuda_tensor(t)))
+        tensors_to_offload = tuple(t for t in saved_tensors if ((not is_in_tensor_args(t)) and is_cuda_tensor(t)))
+        if self.save_tensor_policy is not None:
+            tensors_to_offload = self.save_tensor_policy(tensors_to_offload, forward_trace)
+        self.tensors_to_offload = tensors_to_offload
         return self.tensors_to_offload
 
     def _replace_saved_tensors(self, forward_trace, new_output_map):
