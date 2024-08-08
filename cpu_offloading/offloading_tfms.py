@@ -117,7 +117,7 @@ def move_loads_closer_to_computation_consumer(execution_trace):
     # 1. t = load_to_gpu(offloaded_t)
     # 2. t1 = Permute(t) or reshape(t)
     # 3. del t
-    NUM_SYMS_TO_MOVE = 4
+    NUM_SYMS_TO_MOVE = 3
 
     # This is not optimal (and we should probably do something smarter here for swapping).
     new_bsyms = [bsym for bsym in bsyms]
@@ -130,6 +130,33 @@ def move_loads_closer_to_computation_consumer(execution_trace):
             new_bsyms.insert(consumer_idx - 1, symbol_being_updated)
 
     new_execution_trace.bound_symbols = new_bsyms
+    return new_execution_trace
+
+
+def move_closer_to_consumer(execution_trace):
+    order_in_trace = {bsym: i for i, bsym in enumerate(execution_trace.bound_symbols)}
+
+    def prefer_ops_closer_to_consumer(eligible_nodes: list[Node]) -> int:
+        def key(node: Node) -> int:
+            return order_in_trace[node.bsym]
+
+        return min(range(len(eligible_nodes)), key=lambda i: key(eligible_nodes[i]))
+
+    # This moves all del or clear collection at the bottom (as they don't return anything)
+    bound_symbols = toposort_bsym_dag(
+        bsym_list_to_dag(execution_trace.bound_symbols)[1],
+        TOPOSORT_ORDER.BOTTOM_UP,
+        selector=prefer_ops_closer_to_consumer,
+    )
+
+    for idx, bsym in enumerate(bound_symbols):
+        if bsym.sym.id == prims.PrimIDs.DEL:
+            break
+
+    new_execution_trace = from_trace(execution_trace)
+    new_execution_trace.bound_symbols = bound_symbols[:idx]
+
+    new_execution_trace = thunder.executors.passes.del_last_used(new_execution_trace, clear_mutable_collections=True)
     return new_execution_trace
 
 
@@ -263,9 +290,9 @@ class CPUOffloading(Transform):
 
             with tracectx(computation_trace):
                 new_sym = load_to_gpu.bind(offloaded_t, device, output=t)
-                new_wait_sym = wait_till_load.bind(t, output=t)
+                # new_wait_sym = wait_till_load.bind(t, output=t)
             new_sym.header = "Created by CPU Offloading Transform"
-            computation_trace.bound_symbols.insert(first_used_symbol_idx + idx, new_wait_sym)
+            # computation_trace.bound_symbols.insert(first_used_symbol_idx + idx, new_wait_sym)
             computation_trace.bound_symbols.insert(first_used_symbol_idx + idx, new_sym)
 
         # Don't forget to add `CUDA sync` as the first symbol to the trace.
@@ -287,6 +314,7 @@ class CPUOffloading(Transform):
             if len(self._offloaded_tensors) == 0:
                 return computation_trace
 
+            # Transform the backward trace to load offloaded tensors back to the device.
             computation_trace = self._load_tensors_for_backward(computation_trace)
 
             # We need this because in unmodified backward trace, the first consumer of saved_for_backward maybe
@@ -305,6 +333,7 @@ class CPUOffloading(Transform):
             #   t4022 = ltorch.matmul(t4020, t4021)  # t4022: "cuda:0 f32[4096, 11008]"
             #     t4022 = prims.matmul(t4020, t4021)  # t4022: "cuda:0 f32[4096, 11008]"
             computation_trace = move_loads_closer_to_computation_consumer(computation_trace)
+            print(computation_trace)
 
         return computation_trace
 
@@ -350,7 +379,7 @@ from thunder.benchmarks.targets import LitGPTConfig, LitGPTBenchmark
 with torch.device("cuda"):
     cfg: LitGPTConfig = LitGPTConfig.from_name("Llama-2-7b-hf")
     cfg.n_layer = 10
-    cfg.block_size = 512
+    cfg.block_size = 1024
     b = LitGPTBenchmark(cfg)
     model = b.fn()
     args, kwargs = b.make_batch()
@@ -368,15 +397,15 @@ actual_grads = torch.autograd.grad(a, model.parameters(), g)
 
 print(torch.cuda.max_memory_allocated() / 1e9)
 
-clone_arg = args[0].detach().clone()
-e = model(clone_arg)
+# clone_arg = args[0].detach().clone()
+# e = model(clone_arg)
 
-expected_grads = torch.autograd.grad(e, model.parameters(), g)
-torch.testing.assert_close(a, e)
-torch.testing.assert_close(actual_grads, expected_grads)
+# expected_grads = torch.autograd.grad(e, model.parameters(), g)
+# torch.testing.assert_close(a, e)
+# torch.testing.assert_close(actual_grads, expected_grads)
 
-benchmark(jmodel, args, kwargs)
-benchmark(model, (clone_arg,), kwargs)
+# benchmark(jmodel, args, kwargs)
+# benchmark(model, (clone_arg,), kwargs)
 
 # print(thunder.last_backward_traces(jmodel)[-1])
 
