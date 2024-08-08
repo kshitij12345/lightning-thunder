@@ -314,9 +314,6 @@ class CPUOffloading(Transform):
             if len(self._offloaded_tensors) == 0:
                 return computation_trace
 
-            # Transform the backward trace to load offloaded tensors back to the device.
-            computation_trace = self._load_tensors_for_backward(computation_trace)
-
             # We need this because in unmodified backward trace, the first consumer of saved_for_backward maybe
             # a reshape or permute op and the actual computation occurs 50-100 (or more) lines later.
             # Because of this we load more tensors than required eagerly (thus decreasing the memory gains from CPU Offloading).
@@ -332,8 +329,12 @@ class CPUOffloading(Transform):
             # t4022 = torch.matmul(t4020, t4021)  # t4022: "cuda:0 f32[4096, 11008]"
             #   t4022 = ltorch.matmul(t4020, t4021)  # t4022: "cuda:0 f32[4096, 11008]"
             #     t4022 = prims.matmul(t4020, t4021)  # t4022: "cuda:0 f32[4096, 11008]"
-            computation_trace = move_loads_closer_to_computation_consumer(computation_trace)
-            print(computation_trace)
+            computation_trace = move_closer_to_consumer(computation_trace)
+
+            # Transform the backward trace to load offloaded tensors back to the device.
+            computation_trace = self._load_tensors_for_backward(computation_trace)
+
+            # computation_trace = move_loads_closer_to_computation_consumer(computation_trace)
 
         return computation_trace
 
@@ -426,7 +427,12 @@ print(torch.cuda.max_memory_allocated() / 1e9)
 # 45.460013056
 # 47.167095808
 
-# With TFMS
+# With TFMS (move_loads_closer_to_computation_consumer)
 # 9.195852288
 # 11.846189056
 # 24.500470784
+
+# With TFMS (move_closer_to_consumer)
+# 9.145504256
+# 11.82941184
+# 28.388851712
