@@ -31,13 +31,13 @@ offload_to_cpu = offload_exec.register_operator(
 )
 
 
-# def load_to_gpu_impl(t, device):
-#     with torch.cuda.stream(offload_onload_stream):
-#         return t.to(device)
-
-
 def load_to_gpu_impl(t, device):
-    return t.to(device)
+    with torch.cuda.stream(offload_onload_stream):
+        return t.to(device)
+
+
+# def load_to_gpu_impl(t, device):
+#     return t.to(device)
 
 
 load_to_gpu = offload_exec.register_operator(
@@ -164,8 +164,70 @@ def move_closer_to_consumer(execution_trace):
     return new_execution_trace
 
 
+def limit_in_flight_loads(
+    execution_trace,
+    max_in_flight_loads: int,
+):
+    from collections import deque
+
+    from thunder.core import utils
+
+    new_execution_trace = from_trace(execution_trace)
+    orig_bound_symbols: list[BoundSymbol] = execution_trace.bound_symbols
+    load_bsyms = []
+    wait_bsyms = []
+    # record all the bound symbols except packs+allgathers in order
+    bound_symbols: list[BoundSymbol] = []
+    producers, consumers = utils.producers_and_consumers(execution_trace)
+    for i, bsym in enumerate(orig_bound_symbols):
+        match bsym.sym.id:
+            case load_to_gpu.id:
+                load_bsyms.append(bsym)
+            case wait_till_load.id:
+                assert producers[bsym.flat_proxy_args[0]].sym.id == load_to_gpu.id
+                wait_bsyms.append(bsym)
+                bound_symbols.append(bsym)
+            case _:
+                bound_symbols.append(bsym)
+
+    loads = load_bsyms
+    waits = wait_bsyms
+    utils.check(
+        len(loads) == len(waits),
+        lambda: f"The number of allgathers (={len(loads)}) should be equal to the number of waits (={len(waits)})",
+    )
+    del load_bsyms, wait_bsyms
+
+    new_bsyms = deque()
+    n_running_loads = 0
+    idx_comm = len(waits) - 1
+    idx_wait = len(waits) - 1
+    for i in range(len(bound_symbols) - 1, -1, -1):
+        new_bsyms.appendleft(bound_symbols[i])
+        if bound_symbols[i] == waits[idx_wait]:
+            n_running_loads += 1
+            idx_wait -= 1
+        if n_running_loads == max_in_flight_loads:
+            new_bsyms.appendleft(loads[idx_comm])
+            idx_comm -= 1
+            n_running_loads -= 1
+        if bound_symbols[i] == waits[0]:
+            for idx in range(idx_comm, -1, -1):
+                new_bsyms.appendleft(loads[idx])
+            for idx in range(i - 1, -1, -1):
+                new_bsyms.appendleft(bound_symbols[idx])
+            break
+
+    utils.check(
+        len(new_bsyms) == len(orig_bound_symbols), lambda: f"{len(orig_bound_symbols) = } but {len(new_bsyms) = }"
+    )
+
+    new_execution_trace.bound_symbols = new_bsyms
+    return new_execution_trace
+
+
 class CPUOffloading(Transform):
-    def __init__(self, save_tensor_policy=None):
+    def __init__(self, save_tensor_policy=None, limit_loads=False, max_loads=3):
         self.forward_pass = None
         self.backward_pass = None
         self._offloaded_tensors = ()
@@ -173,6 +235,8 @@ class CPUOffloading(Transform):
         if save_tensor_policy is not None:
             assert callable(save_tensor_policy)
             self.save_tensor_policy = save_tensor_policy
+        self.limit_loads = limit_loads
+        self.max_loads = max_loads
 
     def _get_tensors_to_offload(self, forward_trace):
         return_bsym = forward_trace.bound_symbols[-1]
@@ -306,6 +370,17 @@ class CPUOffloading(Transform):
             # computation_trace.bound_symbols.insert(first_used_symbol_idx + idx, new_wait_sym)
             computation_trace.bound_symbols.insert(first_used_symbol_idx + idx, new_sym)
 
+        def visitor(bound_symbol):
+            if bound_symbol.sym.id == load_to_gpu.id:
+                t = bound_symbol.output
+                # wait_till_load.bind(t, output=t)
+                wait_till_load(t)
+                return thunder.core.transforms.VISIT_TYPE.INSERT_AFTER
+
+            return thunder.core.transforms.VISIT_TYPE.NO_OP
+
+        computation_trace = thunder.core.transforms.visitor_transform(computation_trace, visitor)
+
         # Don't forget to add `CUDA sync` as the first symbol to the trace.
         # Sync streams between forward and backward (as we offload on different stream).
         sync_bsym = sync_stream.bind(output=None)
@@ -345,7 +420,10 @@ class CPUOffloading(Transform):
             # Transform the backward trace to load offloaded tensors back to the device.
             computation_trace = self._load_tensors_for_backward(computation_trace)
 
+            if self.limit_loads:
+                computation_trace = limit_in_flight_loads(computation_trace, max_in_flight_loads=self.max_loads)
             # computation_trace = move_loads_closer_to_computation_consumer(computation_trace)
+            print(computation_trace)
 
         return computation_trace
 
@@ -386,32 +464,51 @@ def benchmark(model, args, kwargs, g, warmup=5, total_iter=10):
         del e, _
     torch.cuda.synchronize()
     end = time.time_ns()
-    print(f"It took {(end - start) / 1e6} ms!")
+
+    required_time = (end - start) / 1e6
+    print(f"It took {required_time} ms!")
+    return required_time
+
+
+class Details:
+    pass
 
 
 from thunder.benchmarks.targets import LitGPTConfig, LitGPTBenchmark
 
 with torch.device("cuda"):
     cfg: LitGPTConfig = LitGPTConfig.from_name("Llama-2-7b-hf")
-    cfg.n_layer = 8
+    cfg.n_layer = 2
     cfg.block_size = 1024
     b = LitGPTBenchmark(cfg)
     model = b.fn()
     args, kwargs = b.make_batch()
 
-offload_tfms = CPUOffloading()
-print(torch.cuda.max_memory_allocated() / 1e9)
-jmodel = thunder.jit(model, transforms=[offload_tfms])
-# jmodel = thunder.jit(model)
-# jmodel = model
+name = "offload_tfms"
+limit_loads = True
+max_loads = 5
+offload_tfms = CPUOffloading(limit_loads=limit_loads, max_loads=max_loads)
+
+memory_after_model_load = torch.cuda.max_memory_allocated() / 1e9
+print(memory_after_model_load)
+
+if name == "offload_tfms":
+    jmodel = thunder.jit(model, transforms=[offload_tfms])
+elif name == "thunder":
+    jmodel = thunder.jit(model)
+elif name == "eager":
+    jmodel = model
 
 a = jmodel(*args, **kwargs)
-print(torch.cuda.max_memory_allocated() / 1e9)
+
+memory_after_forward = torch.cuda.max_memory_allocated() / 1e9
+print(memory_after_forward)
 
 g = torch.rand_like(a) / a.numel()
-# actual_grads = torch.autograd.grad(a, model.parameters(), g)
+actual_grads = torch.autograd.grad(a, model.parameters(), g)
 
-print(torch.cuda.max_memory_allocated() / 1e9)
+memory_after_backward = torch.cuda.max_memory_allocated() / 1e9
+print(memory_after_backward)
 
 # clone_arg = args[0].detach().clone()
 # e = model(clone_arg)
@@ -421,10 +518,28 @@ print(torch.cuda.max_memory_allocated() / 1e9)
 # torch.testing.assert_close(actual_grads, expected_grads)
 
 del a
-# del actual_grads
+del actual_grads
 
-benchmark(jmodel, args, kwargs, g)
+required_time = benchmark(jmodel, args, kwargs, g)
 # benchmark(model, (clone_arg,), kwargs)
+
+d = Details()
+d.required_time = required_time
+d.memory_after_model_load = memory_after_model_load
+d.memory_after_forward = memory_after_forward
+d.memory_after_backward = memory_after_backward
+d.limit_loads = limit_loads
+d.cfg_n_layer = cfg.n_layer
+d.cfg_blocksize = cfg.block_size
+
+import json
+
+if name == "offload_tfms":
+    f_name = f"{name}_limit_loads_{limit_loads}_max_limit_loads_{max_loads}"
+else:
+    f_name = f"{name}"
+# with open(f_name + ".json", 'w') as f:
+#     json.dump(d.__dict__, f, indent=2)
 
 # print(thunder.last_backward_traces(jmodel)[-1])
 
