@@ -492,8 +492,10 @@ offload_tfms = CPUOffloading(limit_loads=limit_loads, max_loads=max_loads)
 memory_after_model_load = torch.cuda.max_memory_allocated() / 1e9
 print(memory_after_model_load)
 
+default_execs = list(thunder.get_default_executors())
+default_execs.pop(1)  # sdpa ex doesn't work because of https://github.com/Lightning-AI/lightning-thunder/issues/950
 if name == "offload_tfms":
-    jmodel = thunder.jit(model, transforms=[offload_tfms])
+    jmodel = thunder.jit(model, transforms=[offload_tfms], executors=default_execs)
 elif name == "thunder":
     jmodel = thunder.jit(model)
 elif name == "eager":
