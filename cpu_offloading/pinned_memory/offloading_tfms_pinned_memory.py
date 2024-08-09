@@ -79,45 +79,6 @@ def get_symbol_to_idx(symbols):
     return {sym: idx for idx, sym in enumerate(symbols)}
 
 
-def move_loads_closer_to_computation_consumer(execution_trace):
-    new_execution_trace = from_trace(execution_trace)
-
-    compute_producers, compute_consumers = thunder.core.utils.producers_and_consumers(execution_trace)
-
-    bsyms = execution_trace.bound_symbols
-    symbol_to_idx = get_symbol_to_idx(bsyms)
-    symbols_to_swap = {}
-    for idx, bound_symbol in enumerate(bsyms):
-        if (
-            bound_symbol.sym.id == load_to_gpu.id
-            and (bsyms[idx + 1].sym.id) in ("reshape", "permute")
-            and bsyms[idx + 2].sym.id == prims.PrimIDs.DEL
-        ):
-            # Assumes the first to be the first consumer in trace.
-            first_consumer = compute_consumers[bsyms[idx + 1].output][0]
-            symbols_to_swap[bound_symbol] = first_consumer
-
-    # Move the loading of tensor - right above the consumer.
-    # We move
-    # 1. t = load_to_gpu(offloaded_t)
-    # 2. t1 = Permute(t) or reshape(t)
-    # 3. del t
-    NUM_SYMS_TO_MOVE = 3
-
-    # This is not optimal (and we should probably do something smarter here for swapping).
-    new_bsyms = [bsym for bsym in bsyms]
-    for symbol, consumer_symbol in symbols_to_swap.items():
-        symbol_to_idx = {sym: idx for idx, sym in enumerate(new_bsyms)}
-        curr_idx = symbol_to_idx[symbol]
-        consumer_idx = symbol_to_idx[consumer_symbol]
-        for _ in range(NUM_SYMS_TO_MOVE):
-            symbol_being_updated = new_bsyms.pop(curr_idx)
-            new_bsyms.insert(consumer_idx - 1, symbol_being_updated)
-
-    new_execution_trace.bound_symbols = new_bsyms
-    return new_execution_trace
-
-
 def move_closer_to_consumer(execution_trace):
     order_in_trace = {bsym: i for i, bsym in enumerate(execution_trace.bound_symbols)}
 
@@ -319,8 +280,6 @@ class CPUOffloading(Transform):
 
             # Transform the backward trace to load offloaded tensors back to the device.
             computation_trace = self._load_tensors_for_backward(computation_trace)
-
-            # computation_trace = move_loads_closer_to_computation_consumer(computation_trace)
 
         return computation_trace
 
