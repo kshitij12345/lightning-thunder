@@ -9,6 +9,7 @@ from thunder.core import prims
 from thunder.core.transforms import bsym_list_to_dag, Node, toposort_bsym_dag, TOPOSORT_ORDER
 
 from collections.abc import Sequence
+from contextlib import nullcontext
 
 import torch
 
@@ -370,6 +371,7 @@ class CPUOffloading(Transform):
             # computation_trace.bound_symbols.insert(first_used_symbol_idx + idx, new_wait_sym)
             computation_trace.bound_symbols.insert(first_used_symbol_idx + idx, new_sym)
 
+        # Insert `wait_till_load` after the `load_to_gpu`.
         def visitor(bound_symbol):
             if bound_symbol.sym.id == load_to_gpu.id:
                 t = bound_symbol.output
@@ -423,7 +425,6 @@ class CPUOffloading(Transform):
             if self.limit_loads:
                 computation_trace = limit_in_flight_loads(computation_trace, max_in_flight_loads=self.max_loads)
             # computation_trace = move_loads_closer_to_computation_consumer(computation_trace)
-            print(computation_trace)
 
         return computation_trace
 
@@ -460,8 +461,9 @@ def benchmark(model, args, kwargs, g, warmup=5, total_iter=10):
         if idx == warmup:
             start = time.time_ns()
         e = model(*args, **kwargs)
-        _ = torch.autograd.grad(e, model.parameters(), g)
-        del e, _
+        # _ = torch.autograd.grad(e, model.parameters(), g)
+        e.sum().backward()
+        del e
     torch.cuda.synchronize()
     end = time.time_ns()
 
@@ -478,7 +480,7 @@ from thunder.benchmarks.targets import LitGPTConfig, LitGPTBenchmark
 
 with torch.device("cuda"):
     cfg: LitGPTConfig = LitGPTConfig.from_name("Llama-2-7b-hf")
-    cfg.n_layer = 2
+    cfg.n_layer = 8
     cfg.block_size = 1024
     b = LitGPTBenchmark(cfg)
     model = b.fn()
@@ -498,6 +500,12 @@ if name == "offload_tfms":
     jmodel = thunder.jit(model, transforms=[offload_tfms], executors=default_execs)
 elif name == "thunder":
     jmodel = thunder.jit(model)
+elif name == "eager_offload":
+
+    def jmodel(*args, **kwargs):
+        with torch.autograd.graph.save_on_cpu(pin_memory=True):
+            return model(*args, **kwargs)
+
 elif name == "eager":
     jmodel = model
 
@@ -540,8 +548,8 @@ if name == "offload_tfms":
     f_name = f"{name}_limit_loads_{limit_loads}_max_limit_loads_{max_loads}"
 else:
     f_name = f"{name}"
-# with open(f_name + ".json", 'w') as f:
-#     json.dump(d.__dict__, f, indent=2)
+with open(f_name + ".json", "w") as f:
+    json.dump(d.__dict__, f, indent=2)
 
 # print(thunder.last_backward_traces(jmodel)[-1])
 
