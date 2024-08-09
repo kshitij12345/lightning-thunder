@@ -373,14 +373,17 @@ class CPUOffloading(Transform):
 #     kwargs = {}
 
 
-def benchmark(model, args, kwargs):
+def benchmark(model, args, kwargs, g, warmup=5, total_iter=10):
     import time
 
     torch.cuda.synchronize()
-    start = time.time_ns()
-    for _ in range(10):
+
+    for idx in range(total_iter):
+        if idx == warmup:
+            start = time.time_ns()
         e = model(*args, **kwargs)
         _ = torch.autograd.grad(e, model.parameters(), g)
+        del e, _
     torch.cuda.synchronize()
     end = time.time_ns()
     print(f"It took {(end - start) / 1e6} ms!")
@@ -390,7 +393,7 @@ from thunder.benchmarks.targets import LitGPTConfig, LitGPTBenchmark
 
 with torch.device("cuda"):
     cfg: LitGPTConfig = LitGPTConfig.from_name("Llama-2-7b-hf")
-    cfg.n_layer = 10
+    cfg.n_layer = 8
     cfg.block_size = 1024
     b = LitGPTBenchmark(cfg)
     model = b.fn()
@@ -400,12 +403,13 @@ offload_tfms = CPUOffloading()
 print(torch.cuda.max_memory_allocated() / 1e9)
 jmodel = thunder.jit(model, transforms=[offload_tfms])
 # jmodel = thunder.jit(model)
+# jmodel = model
 
 a = jmodel(*args, **kwargs)
 print(torch.cuda.max_memory_allocated() / 1e9)
 
 g = torch.rand_like(a) / a.numel()
-actual_grads = torch.autograd.grad(a, model.parameters(), g)
+# actual_grads = torch.autograd.grad(a, model.parameters(), g)
 
 print(torch.cuda.max_memory_allocated() / 1e9)
 
@@ -416,7 +420,10 @@ print(torch.cuda.max_memory_allocated() / 1e9)
 # torch.testing.assert_close(a, e)
 # torch.testing.assert_close(actual_grads, expected_grads)
 
-# benchmark(jmodel, args, kwargs)
+del a
+# del actual_grads
+
+benchmark(jmodel, args, kwargs, g)
 # benchmark(model, (clone_arg,), kwargs)
 
 # print(thunder.last_backward_traces(jmodel)[-1])
@@ -431,6 +438,8 @@ print(torch.cuda.max_memory_allocated() / 1e9)
 # 5.148185088
 # 7.798521856
 # 15.084094464
+
+# 10 Layer Eager OOM
 
 # 10 Layer
 # Without TFMS
