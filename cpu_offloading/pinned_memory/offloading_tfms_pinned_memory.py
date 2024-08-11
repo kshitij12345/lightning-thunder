@@ -18,6 +18,8 @@ offload_exec = OperatorExecutor("offload_exec")
 
 
 def offload_to_cpu_impl(t):
+    # Due to https://github.com/Lightning-AI/lightning-thunder/issues/950
+    # it may receive tensor on CPU.
     if t.device == torch.device("cpu"):
         return t
 
@@ -304,7 +306,7 @@ for param in model.parameters():  # use original model for clear grads
 
 from thunder.benchmarks.targets import LitGPTConfig, LitGPTBenchmark
 
-name = "offload_tfms"
+name = "thunder_offload"
 
 
 def get_model_and_args(name):
@@ -316,14 +318,12 @@ def get_model_and_args(name):
         model = b.fn()
         args, kwargs = b.make_batch()
 
-    default_execs = list(thunder.get_default_executors())
-    offload_tfms = CPUOffloading()
-    # default_execs.pop(1)  # sdpa ex doesn't work because of https://github.com/Lightning-AI/lightning-thunder/issues/950
-    if name == "offload_tfms":
-        jmodel = thunder.jit(model, transforms=[offload_tfms], executors=default_execs)
+    if name == "thunder_offload":
+        offload_tfms = CPUOffloading()
+        jmodel = thunder.jit(model, transforms=[offload_tfms])
     elif name == "thunder":
         # Use same executors for consistency in comparison.
-        jmodel = thunder.jit(model, executors=default_execs)
+        jmodel = thunder.jit(model)
     elif name == "eager_offload":
 
         def jmodel(*args, **kwargs):
