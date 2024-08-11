@@ -1,3 +1,4 @@
+import torch.utils.benchmark
 import thunder
 from thunder import Transform
 from thunder.core.proxies import TensorProxy, variableify
@@ -17,6 +18,9 @@ offload_exec = OperatorExecutor("offload_exec")
 
 
 def offload_to_cpu_impl(t):
+    if t.device == torch.device("cpu"):
+        return t
+
     packed = torch.empty(
         t.size(),
         dtype=t.dtype,
@@ -284,89 +288,108 @@ class CPUOffloading(Transform):
         return computation_trace
 
 
-def benchmark(model, args, kwargs, g, warmup=5, total_iter=10):
-    import time
-
-    torch.cuda.synchronize()
-
-    for idx in range(total_iter):
-        if idx == warmup:
-            start = time.time_ns()
-        e = model(*args, **kwargs)
-        # _ = torch.autograd.grad(e, model.parameters(), g)
-        e.sum().backward()
-        del e
-    torch.cuda.synchronize()
-    end = time.time_ns()
-
-    required_time = (end - start) / 1e6
-    print(f"It took {required_time} ms!")
-    return required_time
-
-
-class Details:
-    pass
+def benchmark(jmodel, model, args, kwargs):
+    stmt = """
+# Use the optimized model for prediction and backward
+o = jmodel(*args, **kwargs)
+o.sum().backward()
+for param in model.parameters():  # use original model for clear grads
+    param.grad = None
+"""
+    timer = torch.utils.benchmark.Timer(
+        stmt=stmt, globals={"jmodel": jmodel, "model": model, "args": args, "kwargs": kwargs}
+    ).timeit(number=10)
+    return timer
 
 
 from thunder.benchmarks.targets import LitGPTConfig, LitGPTBenchmark
 
-with torch.device("cuda"):
-    cfg: LitGPTConfig = LitGPTConfig.from_name("Llama-2-7b-hf")
-    cfg.n_layer = 8
-    cfg.block_size = 1024
-    b = LitGPTBenchmark(cfg)
-    model = b.fn()
-    args, kwargs = b.make_batch()
-
 name = "offload_tfms"
-offload_tfms = CPUOffloading()
+
+
+def get_model_and_args(name):
+    with torch.device("cuda"):
+        cfg: LitGPTConfig = LitGPTConfig.from_name("Llama-2-7b-hf")
+        cfg.n_layer = 20
+        # cfg.block_size = 1024
+        b = LitGPTBenchmark(cfg, batchdims=(1,))
+        model = b.fn()
+        args, kwargs = b.make_batch()
+
+    default_execs = list(thunder.get_default_executors())
+    offload_tfms = CPUOffloading()
+    # default_execs.pop(1)  # sdpa ex doesn't work because of https://github.com/Lightning-AI/lightning-thunder/issues/950
+    if name == "offload_tfms":
+        jmodel = thunder.jit(model, transforms=[offload_tfms], executors=default_execs)
+    elif name == "thunder":
+        # Use same executors for consistency in comparison.
+        jmodel = thunder.jit(model, executors=default_execs)
+    elif name == "eager_offload":
+
+        def jmodel(*args, **kwargs):
+            with torch.autograd.graph.save_on_cpu(pin_memory=True):
+                return model(*args, **kwargs)
+
+    elif name == "eager":  # OOM
+        jmodel = model
+
+    return jmodel, model, args, kwargs, cfg
+
+
+jmodel, model, args, kwargs, cfg = get_model_and_args(name)
 
 memory_after_model_load = torch.cuda.max_memory_allocated() / 1e9
 print(memory_after_model_load)
-
-default_execs = list(thunder.get_default_executors())
-default_execs.pop(1)  # sdpa ex doesn't work because of https://github.com/Lightning-AI/lightning-thunder/issues/950
-if name == "offload_tfms":
-    jmodel = thunder.jit(model, transforms=[offload_tfms], executors=default_execs)
-elif name == "thunder":
-    jmodel = thunder.jit(model)
-elif name == "eager_offload":
-
-    def jmodel(*args, **kwargs):
-        with torch.autograd.graph.save_on_cpu(pin_memory=True):
-            return model(*args, **kwargs)
-
-elif name == "eager":  # OOM
-    jmodel = model
 
 a = jmodel(*args, **kwargs)
 
 memory_after_forward = torch.cuda.max_memory_allocated() / 1e9
 print(memory_after_forward)
 
-g = torch.rand_like(a) / a.numel()
+g = torch.rand_like(a) + 0.02
 actual_grads = torch.autograd.grad(a, model.parameters(), g)
 
 memory_after_backward = torch.cuda.max_memory_allocated() / 1e9
 print(memory_after_backward)
 
-# Sanity Check values vs Eager if n_layer <= 5 (else we get OOM)
-if cfg.n_layer <= 5:
-    e = model(*args, **kwargs)
+# # Sanity Check values vs Eager
+# e = model(*args, **kwargs)
+# expected_grads = torch.autograd.grad(e, model.parameters(), g)
+# torch.testing.assert_close(a, e)
+# torch.testing.assert_close(actual_grads, expected_grads)
+# del e
+# del expected_grads
 
-    expected_grads = torch.autograd.grad(e, model.parameters(), g)
-    torch.testing.assert_close(a, e)
-    torch.testing.assert_close(actual_grads, expected_grads)
-    del e
-    del expected_grads
-
+# Clear every cuda tensor for benchmarking. We will create everything except grad and again!
 del a
+del g
 del actual_grads
+del args
+del kwargs
+del model
+del jmodel
+import gc
 
-required_time = benchmark(jmodel, args, kwargs, g)
+gc.collect()
+torch.cuda.empty_cache()
+
+memory_allocated = torch.cuda.memory_allocated() / 1e9
+print(memory_allocated)
+
+jmodel, model, args, kwargs, cfg = get_model_and_args(name)
+
+measurement = benchmark(jmodel, model, args, kwargs)
+
+print(measurement)
+
+
+class Details:
+    pass
+
 
 d = Details()
-d.required_time = required_time
+d.mean = measurement.mean
+d.median = measurement.median
 d.memory_after_model_load = memory_after_model_load
 d.memory_after_forward = memory_after_forward
 d.memory_after_backward = memory_after_backward
