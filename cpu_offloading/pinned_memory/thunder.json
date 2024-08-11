@@ -1,8 +1,0 @@
-{
-  "required_time": 25079.996948,
-  "memory_after_model_load": 7.526437376,
-  "memory_after_forward": 36.827938816,
-  "memory_after_backward": 39.26900736,
-  "cfg_n_layer": 8,
-  "cfg_blocksize": 1024
-}
