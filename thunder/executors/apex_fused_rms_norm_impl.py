@@ -29,7 +29,7 @@ def meta_fn(input: TensorLike, weight: TensorLike, normalized_shape: Sequence[in
 
 
 # Symbol which will be used by lookaside.
-fused_rms_norm = apex_ex.register_operator("fused_rms_norm", meta=meta_fn)
+# fused_rms_norm = apex_ex.register_operator("fused_rms_norm", meta=meta_fn)
 
 
 def meta_impl_fn(
@@ -101,7 +101,7 @@ def _fused_rms_norm_checker(
 
 
 apex_ex.register_implementation(
-    fused_rms_norm,
+    fused_rms_norm_fwd,
     execution_transform=execution_tfms,
     grad_transform=fused_rms_norm_grad_rule,
     checker=_fused_rms_norm_checker,
@@ -118,6 +118,6 @@ def maybe_register_apex_fused_rms_norm_lookaside() -> None:
         def rms_forward_lookaside(ctx, input, weight, normalized_shape, eps, memory_efficient=False):
             # This is the symbol we created.
             # NOTE - We don't use the `ctx` passed by PyTorch but instead use our Context to track saved_tensors and metadata.
-            return fused_rms_norm(input, weight, normalized_shape, eps, memory_efficient)
+            return fused_rms_norm_fwd(input, weight, normalized_shape, eps, memory_efficient)
 
     return None
