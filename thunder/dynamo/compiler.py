@@ -1,5 +1,6 @@
 import torch
 import warnings
+from collections.abc import Mapping
 
 from thunder.core.baseutils import run_once
 
@@ -10,6 +11,27 @@ def _warn_thunder_compiler():
         "The ThunderCompiler is in active development and may not work as expected."
         + " Please report any issues you encounter to the Lightning Thunder team."
     )
+
+
+from torch.fx.passes import operator_support
+
+from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
+from thunder.torch import _torch_to_thunder_function_map
+
+
+class ThunderOperatorSupport(operator_support.OperatorSupport):
+    def is_node_supported(self, submodules: Mapping[str, torch.nn.Module], node: torch.fx.Node):
+        import operator
+
+        # return super().is_node_supported(submodules, node)
+        # print(node.name, node.op, node.target)
+
+        if node.target in (operator.add, operator.sub, operator.mul):
+            return True
+
+        if node.target in _torch_to_thunder_function_map:
+            return True
+        return False
 
 
 class ThunderCompiler:
@@ -60,6 +82,14 @@ class ThunderCompiler:
 
     def __call__(self, gm: torch.fx.GraphModule, sample_args: list[torch.SymInt, torch.Tensor]):
         from thunder import jit
+        import copy
+
+        # gm_copy = copy.deepcopy(gm)
+        gm_copy = gm
+        op_support = ThunderOperatorSupport()
+        partitioner = CapabilityBasedPartitioner(gm_copy, op_support)
+        fused_partition = partitioner.partition_and_fuse()
+        gm_copy.print_readable()
 
         # Dynamo uses lazy generation of the underlying Python code, so we need to
         # force recompilation of the GraphModule before passing it to Thunder.
