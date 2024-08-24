@@ -81,8 +81,8 @@ class SubgraphInfo:
         original_graph_module (torch.fx.GraphModule): The original graph module.
         compiled_functions (list[CompiledFunction]): A list of compiled functions derived from the subgraph. This will be a list with one function in case the graph was not split.
         is_split (bool): Indicates whether the subgraph has been split. This happens if there was a thunder unsupported functionality.
-        split_reasons (list[SplitReason] | None): Optional list of reasons explaining why the subgraph was split. Defaults to None. Present only if `is_split` is True.
-        split_graph_module (torch.fx.GraphModule | None): Optional. The graph module for the split subgraph. Defaults to None. Present only if `is_split` is True.
+        split_reasons (list[SplitReason] | None): Optional list of reasons explaining why the subgraph was split. Present only if `is_split` is True.
+        split_graph_module (torch.fx.GraphModule | None): Optional. The graph module for the split subgraph. Present only if `is_split` is True.
     """
 
     original_graph_module: torch.fx.GraphModule
@@ -272,6 +272,7 @@ class ThunderCompiler:
         # Create an `ThunderOperatorSupport` which will be used in the callback.
         operator_support = ThunderOperatorSupport(gm)
 
+        # TODO - Document this part.
         prev_value = None
         partition_cnt = 0
         supported_partitions = set()
