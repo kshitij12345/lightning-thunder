@@ -282,7 +282,9 @@ class ThunderCompiler:
         self.thunder_options = thunder_options
         self.thunder_jit = partial(jit, **thunder_options)
 
-    def splitter(self, gm: torch.fx.GraphModule, _unused_sample_args: list[torch.SymInt, torch.Tensor]):
+    def splitter(
+        self, gm: torch.fx.GraphModule, _unused_sample_args: list[torch.SymInt, torch.Tensor]
+    ) -> torch.fx.GraphModule:
         """
         This method will split graph into multiple graph modules based on thunder supported operations.
         This function will try to split the graph in contiguous partitions.
@@ -337,29 +339,41 @@ class ThunderCompiler:
                         matmul: "f32[]" = torch.matmul(l_x_, y);  l_x_ = y = None
                         return matmul
         """
-        # Create an `ThunderOperatorSupport` which will be used in the callback.
+        # Create an `ThunderOperatorSupport` instance which will be used in the callback.
+        # This will determine whether the operation represented by the node is supported by thunder.
         operator_support = ThunderOperatorSupport(gm)
 
-        # TODO - Document this part.
+        # The callback below is called for every node in the graph.
+        # It returns an `int` denoting the parition where the node should be placed.
+        # We want to partition the graph into contiguous regions (with one or more operations)
+        # into thunder supported or unsupported region.
+        # `prev_value` is used to determine if we are still in same region (i.e. supported region or unsupported region).
+        # `partition_cnt` is bumped everytime we change the region i.e. flip from supported to unsupported or from unsupported to supported.
+        # `supported_partitions` is used to track the thunder supported partitions.
         prev_value = None
         partition_cnt = 0
         supported_partitions = set()
 
-        def callback(node):
+        def callback(node) -> int:
             nonlocal prev_value, partition_cnt
-            new_value = operator_support.is_node_supported(gm, node)
-            if prev_value == new_value:
+            is_thunder_supported = operator_support.is_node_supported(gm, node)
+            if prev_value == is_thunder_supported:  # We are in the same region.
                 return partition_cnt
 
-            prev_value = new_value
-            partition_cnt += 1
-            if new_value:
+            # There is a flip. Either from supported to unsupported or unsupported to supported.
+            prev_value = is_thunder_supported
+            partition_cnt += 1  # Bump the region cnt.
+
+            if is_thunder_supported:
                 supported_partitions.add(partition_cnt)
             return partition_cnt
 
-        split_module = fx_split_module(gm, None, callback, keep_original_order=True, keep_original_node_name=True)
+        # `fx_split_module` iterates over nodes and determines the partition to place them based on the callback.
+        split_module: torch.fx.GraphModule = fx_split_module(
+            gm, root_m=None, split_callback=callback, keep_original_order=True, keep_original_node_name=True
+        )
 
-        def is_thunder_supported_partition(node: torch.fx.Node):
+        def is_thunder_supported_partition(node: torch.fx.Node) -> bool:
             return node.name.startswith("submod") and int(node.name.replace("submod_", "")) in supported_partitions
 
         # Call compile on the split region/s.
