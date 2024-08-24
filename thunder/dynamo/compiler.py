@@ -6,8 +6,10 @@ import pprint
 import itertools
 import copy
 from functools import partial
+import operator
 
 import torch
+from torch.fx.passes.split_module import split_module as fx_split_module
 import warnings
 from collections.abc import Mapping
 from torch.fx.passes import operator_support
@@ -121,8 +123,6 @@ class ThunderOperatorSupport:
                     self.unsupported_nodes.add(node)
 
     def is_node_supported(self, submodules: Mapping[str, torch.nn.Module], node: torch.fx.Node):
-        import operator
-
         if node in self.unsupported_nodes:
             self.split_reasons.append(
                 SplitReason(
@@ -139,6 +139,7 @@ class ThunderOperatorSupport:
             assert target is not None, f"Failed to find method {node.target}"
 
         if target in (operator.add, operator.sub, operator.mul, operator.getitem, operator.gt, operator.lt):
+            # Example - x: "f32[2]" = l_x_ + 2;  l_x_ = None
             return True
 
         if target in auto_register_ops:
@@ -222,16 +223,7 @@ class ThunderCompiler:
         self.thunder_options = thunder_options
         self.thunder_jit = partial(jit, **thunder_options)
 
-        # TODO: There will be pieces of Dynamo IR that Thunder cannot compile, so we
-        # will need to build a fallback mechanism to handle those cases.
-        # Possible stages of the compilation that need to be saved for inspection:
-        # 1. The GraphModule as it was passed to ThunderCompiler.
-        # 2. The GraphModule after split for Thunder/PyTorch.
-        # 3. If the whole GraphModule is not supported, record the reasons why.
-
     def splitter(self, gm, sample_input):
-        from torch.fx.passes.split_module import split_module
-
         operator_support = ThunderOperatorSupport(gm)
 
         prev_value = None
@@ -250,25 +242,25 @@ class ThunderCompiler:
                 supported_partitions.add(partition_cnt)
             return partition_cnt
 
-        split_m = split_module(gm, None, callback, keep_original_order=True, keep_original_node_name=True)
+        split_module = fx_split_module(gm, None, callback, keep_original_order=True, keep_original_node_name=True)
         compiled_funcs = []
-        for node in split_m.graph.nodes:
+        for node in split_module.graph.nodes:
             if (
                 node.name.startswith("submod") and int(node.name.replace("submod_", "")) in supported_partitions
             ):  # For thunder
-                graph_module = getattr(split_m, node.name)
+                graph_module = getattr(split_module, node.name)
                 jit_fn = self.thunder_jit(graph_module)
-                setattr(split_m, node.name, jit_fn)
+                setattr(split_module, node.name, jit_fn)
                 compiled_funcs.append(CompiledFunction(graph_module, jit_fn, CompilerType.THUNDER))
             elif node.name.startswith("submod"):  # For inductor
-                graph_module = getattr(split_m, node.name)
+                graph_module = getattr(split_module, node.name)
                 jit_fn = torch.compile(graph_module, backend="inductor")
-                setattr(split_m, node.name, jit_fn)
+                setattr(split_module, node.name, jit_fn)
                 compiled_funcs.append(CompiledFunction(graph_module, jit_fn, CompilerType.TORCH_INDUCTOR))
 
         self.subgraph_infos.append(SubgraphInfo(gm, compiled_funcs, True, operator_support.split_reasons, split_module))
         # pprint.pprint(self.subgraph_infos[-1].split_reasons)
-        return split_m
+        return split_module
 
     def __call__(self, gm: torch.fx.GraphModule, sample_args: list[torch.SymInt, torch.Tensor]):
         from thunder import jit
@@ -279,13 +271,13 @@ class ThunderCompiler:
 
         # Check if the complete graph `gm` is supported by thunder
         # If yes, pass the whole `gm` to `thunder.jit` and return the compiled function.
-        if is_graph_supported_by_thunder(gm, sample_args):
-            jitted_gm = self.thunder_jit(gm)
-            self.thunder_fns.append(jitted_gm)
-            self.thunder_to_gm[jitted_gm] = gm
-            compiled_fn = CompiledFunction(gm, jitted_gm, CompilerType.THUNDER)
-            self.subgraph_infos.append(SubgraphInfo(gm, [compiled_fn], False))
-            return jitted_gm
+        # if is_graph_supported_by_thunder(gm, sample_args):
+        #     jitted_gm = self.thunder_jit(gm)
+        #     self.thunder_fns.append(jitted_gm)
+        #     self.thunder_to_gm[jitted_gm] = gm
+        #     compiled_fn = CompiledFunction(gm, jitted_gm, CompilerType.THUNDER)
+        #     self.subgraph_infos.append(SubgraphInfo(gm, [compiled_fn], False))
+        #     return jitted_gm
 
         # The whole graph is not supported by `thunder`, so we split it in `thunder` supported sections
         # and unsupported sections which are passed to `torch.compile(backend='inductor')`
