@@ -67,6 +67,15 @@ class SplitReasonType(Enum):
 
 @dataclasses.dataclass
 class SplitReason:
+    """
+    A dataclass containing information about a split.
+
+    Attributes:
+        type (SplitReasonType): Reason for the split.
+        info (str): String with details of what caused the split.
+        exception (Exception | None): Exception if there was any.
+    """
+
     type: SplitReasonType
     info: str | None
     exception: Exception | None = None
@@ -109,6 +118,7 @@ def try_execute_symbol(thunder_symbol: "Symbol", node: torch.fx.Node) -> tuple[b
                     return proxy(example_value)
 
                 # This is int, float, etc.
+                # TODO(kshitij12345) - verify the above line for more cases.
                 return arg_node
 
             proxy_args = tuple(map(make_tensor_proxy, node.args))
@@ -129,7 +139,7 @@ def try_execute_symbol(thunder_symbol: "Symbol", node: torch.fx.Node) -> tuple[b
                 exception=e,
             )
 
-    # Execution was successful.
+    # Execution with proxies was successful.
     return True, None
 
 
@@ -141,6 +151,11 @@ class ThunderOperatorSupport:
         self.split_reasons: list[SplitReason] = []
 
     def find_unsupported_ctx_regions(self, gm):
+        """
+        Finds the node within `autocast` or other supported context and marks them as unsupported.
+        Even though, thunder may support the operation within the reason, it doesn't correctly apply the change
+        triggered from the context.
+        """
         # NOTE - Currently only detects the autocast regions.
 
         ctx_cnt = 0  # Count of `enters_autocast` we have seen till now
@@ -215,10 +230,12 @@ class ThunderOperatorSupport:
         return False
 
 
-def is_graph_supported_by_thunder(gm, sample_input):
+def _all_graph_supported_by_thunder(gm: torch.fx.GraphModule, sample_input: list[torch.SymInt, torch.Tensor]) -> bool:
+    """
+    Determine whether there is any thunder unsupported operation.
+    """
     op_support = ThunderOperatorSupport(gm)
     supported = True
-    # gm.graph.print_tabular()
     for node in gm.graph.nodes:
         if node.op in ["call_method", "call_function"]:
             supported = op_support.is_node_supported(gm, node)
@@ -256,19 +273,70 @@ class ThunderCompiler:
         _warn_thunder_compiler()
 
         # Thunder-compiled functions should be readily available for inspection
-        # and testing, so we will store them in a list. The order of the
+        # and testing, so we will store them in a list[SubgraphInfo]. The order of the
         # functions in the list will be the same as the order in which they were
-        # compiled. In addition, we will store a mapping from the ThunderModule
-        # to the GraphModule that was passed to ThunderCompiler. This will allow
-        # us to inspect the GraphModule that was compiled by Thunder.
-        self.thunder_fns: list[ThunderModule] = []
-        self.thunder_to_gm: dict[ThunderModule, torch.fx.GraphModule] = {}
+        # compiled.
+        # Ref to the documentation of `SubgraphInfo` to know more about the information it contains.
         self.subgraph_infos: list[SubgraphInfo] = []
 
         self.thunder_options = thunder_options
         self.thunder_jit = partial(jit, **thunder_options)
 
-    def splitter(self, gm, sample_input):
+    def splitter(self, gm: torch.fx.GraphModule, _unused_sample_args: list[torch.SymInt, torch.Tensor]):
+        """
+        This method will split graph into multiple graph modules based on thunder supported operations.
+        This function will try to split the graph in contiguous partitions.
+
+        Example:
+            # All operations are supported by thunder
+            class GraphModule(torch.nn.Module):
+                def forward(self, L_x_: "f32[2]"):
+                    l_x_ = L_x_
+
+                    y: "f32[2]" = torch.sin(l_x_)
+                    matmul: "f32[]" = torch.matmul(l_x_, y);  l_x_ = y = None
+                    return (matmul,)
+
+            # Split Graph: All operations are supported by thunder, we will see only one partition.
+            class GraphModule(torch.nn.Module):
+                def forward(self, l_x_: "f32[2]"):
+                    submod_1 = self.submod_1(l_x_);  l_x_ = None
+                    return (submod_1,)
+
+                class submod_1(torch.nn.Module):
+                    def forward(self, l_x_: "f32[2]"):
+                        y: "f32[2]" = torch.sin(l_x_)
+                        matmul: "f32[]" = torch.matmul(l_x_, y);  l_x_ = y = None
+                        return matmul
+
+        Example:
+            # With unsupported operation `sinc`
+            class GraphModule(torch.nn.Module):
+                def forward(self, L_x_: "f32[2]"):
+                    l_x_ = L_x_
+
+                    y: "f32[2]" = torch.sinc(l_x_)
+
+                    matmul: "f32[]" = torch.matmul(l_x_, y);  l_x_ = y = None
+                    return (matmul,)
+
+            # Split Graph: Since `sinc` is unsupported, we will see two partitions, one for thunder and one for inductor.
+            class GraphModule(torch.nn.Module):
+                def forward(self, l_x_: "f32[2]"):
+                    submod_1 = self.submod_1(l_x_)
+                    submod_2 = self.submod_2(l_x_, submod_1);  l_x_ = submod_1 = None
+                    return (submod_2,)
+
+                class submod_1(torch.nn.Module):  # Partition for inductor
+                    def forward(self, l_x_: "f32[2]"):
+                        y: "f32[2]" = torch.sinc(l_x_);  l_x_ = None
+                        return y
+
+                class submod_2(torch.nn.Module):  # Partition for thunder
+                    def forward(self, l_x_: "f32[2]", y: "f32[2]"):
+                        matmul: "f32[]" = torch.matmul(l_x_, y);  l_x_ = y = None
+                        return matmul
+        """
         # Create an `ThunderOperatorSupport` which will be used in the callback.
         operator_support = ThunderOperatorSupport(gm)
 
@@ -313,7 +381,7 @@ class ThunderCompiler:
 
         # Append the details regarding this graph/subgraph.
         self.subgraph_infos.append(SubgraphInfo(gm, comipled_fn, True, operator_support.split_reasons, split_module))
-        # pprint.pprint(self.subgraph_infos[-1].split_reasons)
+
         return split_module
 
     def __call__(self, gm: torch.fx.GraphModule, sample_args: list[torch.SymInt, torch.Tensor]):
