@@ -115,6 +115,8 @@ def try_execute_symbol(thunder_symbol: "Symbol", node: torch.fx.Node) -> tuple[b
                 # This is a Node in the graph representing a Tensor.
                 if isinstance(arg_node, torch.fx.Node):
                     example_value = arg_node.meta["example_value"]
+
+                    # This fails if the shape of the FakeTensor contains SymInts.
                     return proxy(example_value)
 
                 # This is int, float, etc.
