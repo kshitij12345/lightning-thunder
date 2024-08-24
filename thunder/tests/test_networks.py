@@ -54,10 +54,6 @@ def test_nanogpt_complete(executor, device, dtype):
 # See issue "Add half precision dtype tests to test_networks.py"
 @instantiate(dtypes=(thunder.float32,), executors=all_test_executors_and_dynamo)
 def test_nanogpt_complete_autograd(executor, device, dtype):
-    ctx = nullcontext()
-    if executor == DynamoThunderExecutor and "cuda" in device:
-        # See - https://github.com/Lightning-AI/lightning-thunder/issues/1038
-        ctx = pytest.raises(ValueError, match="is being overwritten")
     tdtype = ttorch.to_torch_dtype(dtype)
 
     # Creates a nanoGPT model with a smaller size than any of the default options for testing
@@ -72,12 +68,11 @@ def test_nanogpt_complete_autograd(executor, device, dtype):
 
     cmodel = executor.make_callable(gpt)
 
-    with ctx:
-        thunder_result = cmodel(x, targets=targets)
-        thunder_grads = torch.autograd.grad(thunder_result[1], gpt.parameters())
+    thunder_result = cmodel(x, targets=targets)
+    thunder_grads = torch.autograd.grad(thunder_result[1], gpt.parameters())
 
-        assert_close(torch_result, thunder_result)
-        assert_close(torch_grads, thunder_grads, atol=1e-1, rtol=1e-1)
+    assert_close(torch_result, thunder_result)
+    assert_close(torch_grads, thunder_grads, atol=1e-1, rtol=1e-1)
 
 
 def _there_is_cudagraph_sym(trace):

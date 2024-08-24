@@ -31,13 +31,14 @@ def test_basic(executor, device: str, dtype: dtypes.dtype, dynamic: bool | None)
     assert out.grad_fn is not None
     assert out.grad_fn.name() == "ThunderFunctionBackward"
 
-    # # We record the GraphModules that was compiled by ThunderCompiler
+    # We record the GraphModules that was compiled by ThunderCompiler
     # assert len(backend.thunder_to_gm) == 2
-    # thunder_func, gm = list(backend.thunder_to_gm.items())[0]
-    # assert isinstance(gm, torch.fx.GraphModule)
+    assert len(backend.subgraph_infos) == 2
+    thunder_func, gm = list(backend.thunder_to_gm.items())[0]
+    assert isinstance(gm, torch.fx.GraphModule)
 
-    # # This shouldn't be empty
-    # assert last_traces(thunder_func)
+    # This shouldn't be empty
+    assert last_traces(thunder_func)
 
 
 def test_basic_splitter():
@@ -54,45 +55,56 @@ def test_basic_splitter():
     expected = torch.compile(func, dynamic=False)(x)
     actual = cfunc(x)
 
+    g = torch.rand_like(actual)
     torch.testing.assert_close(actual, expected)
+    actual_grad = torch.autograd.grad(actual, x, g)
+    expected_grad = torch.autograd.grad(expected, x, g)
+    torch.testing.assert_close(actual_grad, expected_grad)
 
 
-# def test_splitter_unsupported_ctx():
-#     dynamic = False
-#     x = torch.ones(2, requires_grad=True)
+def test_splitter_unsupported_ctx():
+    dynamic = False
+    x = torch.rand(2, 2, requires_grad=True)
 
-#     backend = ThunderCompiler()
+    backend = ThunderCompiler()
 
-#     def func(x):
-#         x = x + 2
-#         with torch.autocast("cpu"):
-#             y = torch.sin(x)
-#             return torch.matmul(x, y)
+    def func(x):
+        x = x + 2
+        with torch.autocast("cpu"):
+            y = torch.log(x)
+            return torch.matmul(x, y)
 
-#     expected = torch.compile(func, dynamic=False)(x)
+    expected = torch.compile(func, dynamic=False)(x)
 
-#     cfunc = torch.compile(func, backend=backend, dynamic=dynamic)
-#     actual = cfunc(x)
+    cfunc = torch.compile(func, backend=backend, dynamic=dynamic)
+    actual = cfunc(x)
+
+    g = torch.rand_like(actual)
+    torch.testing.assert_close(actual, expected)
+    actual_grad = torch.autograd.grad(actual, x, g)
+    expected_grad = torch.autograd.grad(expected, x, g)
+    torch.testing.assert_close(actual_grad, expected_grad)
 
 
-#     torch.testing.assert_close(actual, expected)
+def test_splitter_unsupported_ctx_with_graph_break():
+    dynamic = False
+    x = torch.rand(2, 2, requires_grad=True)
 
+    backend = ThunderCompiler()
 
-# def test_splitter_unsupported_ctx_with_graph_break():
-#     dynamic = False
-#     x = torch.ones(2, 2, requires_grad=True)
+    def func(x):
+        x = x + 2
+        with torch.autocast("cpu"):
+            y = torch.sin(x)
+            torch._dynamo.graph_break()
+            return torch.matmul(x, y)
 
-#     backend = ThunderCompiler()
+    expected = torch.compile(func, dynamic=False)(x)
+    cfunc = torch.compile(func, backend=backend, dynamic=dynamic)
+    actual = cfunc(x)
 
-#     def func(x):
-#         x = x + 2
-#         with torch.autocast("cpu"):
-#             y = torch.sin(x)
-#             torch._dynamo.graph_break()
-#             return torch.matmul(x, y)
-
-#     expected = torch.compile(func, dynamic=False)(x)
-#     cfunc = torch.compile(func, backend=backend, dynamic=dynamic)
-#     actual = cfunc(x)
-
-#     torch.testing.assert_close(actual, expected)
+    g = torch.rand_like(actual)
+    torch.testing.assert_close(actual, expected)
+    actual_grad = torch.autograd.grad(actual, x, g)
+    expected_grad = torch.autograd.grad(expected, x, g)
+    torch.testing.assert_close(actual_grad, expected_grad)
