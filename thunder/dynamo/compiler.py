@@ -32,10 +32,6 @@ def _warn_thunder_compiler():
 class CompilerType(Enum):
     """
     An enumeration representing different types of compilers.
-
-    Attributes:
-        THUNDER: Represents the `thunder.jit`.
-        TORCH_INDUCTOR: Represents the `torch.compile(backend="inductor")`.
     """
 
     THUNDER = auto()
@@ -59,6 +55,10 @@ class CompiledFunction:
 
 
 class SplitReasonType(Enum):
+    """
+    An enumeration representing different reasons for split in the graph.
+    """
+
     UNSUPPORTED_NODE = auto()
     MISSING_OP_SUPPORT = auto()
     EXCEPTION_PROXY_THUNDER_OP = auto()
@@ -92,7 +92,7 @@ class SubgraphInfo:
     split_graph_module: torch.fx.GraphModule | None = None
 
 
-def try_execute_symbol(thunder_symbol, node) -> tuple[bool, SplitReason | None]:
+def try_execute_symbol(thunder_symbol: "Symbol", node: torch.fx.Node) -> tuple[bool, SplitReason | None]:
     import thunder
     from thunder.core.trace import TraceCtx
     from thunder.core.proxies import proxy
@@ -129,6 +129,7 @@ def try_execute_symbol(thunder_symbol, node) -> tuple[bool, SplitReason | None]:
                 exception=e,
             )
 
+    # Execution was successful.
     return True, None
 
 
@@ -268,6 +269,7 @@ class ThunderCompiler:
         self.thunder_jit = partial(jit, **thunder_options)
 
     def splitter(self, gm, sample_input):
+        # Create an `ThunderOperatorSupport` which will be used in the callback.
         operator_support = ThunderOperatorSupport(gm)
 
         prev_value = None
@@ -291,24 +293,25 @@ class ThunderCompiler:
         def is_thunder_supported_partition(node: torch.fx.Node):
             return node.name.startswith("submod") and int(node.name.replace("submod_", "")) in supported_partitions
 
-        # Call compile on the split regions.
-        compiled_funcs = []
+        # Call compile on the split region/s.
+        comipled_fn = []
         for node in split_module.graph.nodes:
             if is_thunder_supported_partition(node):
                 graph_module = getattr(split_module, node.name)
                 jit_fn = self.thunder_jit(graph_module)
                 setattr(split_module, node.name, jit_fn)
-                compiled_funcs.append(CompiledFunction(graph_module, jit_fn, CompilerType.THUNDER))
+                comipled_fn.append(CompiledFunction(graph_module, jit_fn, CompilerType.THUNDER))
             elif node.name.startswith("submod"):  # For inductor
                 graph_module = getattr(split_module, node.name)
                 jit_fn = torch.compile(graph_module, backend="inductor")
                 setattr(split_module, node.name, jit_fn)
-                compiled_funcs.append(CompiledFunction(graph_module, jit_fn, CompilerType.TORCH_INDUCTOR))
-
-            # Everything else is a glue code to call and pass outputs between the other partitions.
+                comipled_fn.append(CompiledFunction(graph_module, jit_fn, CompilerType.TORCH_INDUCTOR))
+            else:
+                # Everything else is a glue code to call and pass outputs between the other partitions.
+                pass
 
         # Append the details regarding this graph/subgraph.
-        self.subgraph_infos.append(SubgraphInfo(gm, compiled_funcs, True, operator_support.split_reasons, split_module))
+        self.subgraph_infos.append(SubgraphInfo(gm, comipled_fn, True, operator_support.split_reasons, split_module))
         # pprint.pprint(self.subgraph_infos[-1].split_reasons)
         return split_module
 
