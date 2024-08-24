@@ -79,14 +79,14 @@ class SubgraphInfo:
 
     Attributes:
         original_graph_module (torch.fx.GraphModule): The original graph module.
-        compiled_functions (list[CompiledFunctions]): A list of compiled functions derived from the subgraph. This will be a list with one function in case the graph was not split.
+        compiled_functions (list[CompiledFunction]): A list of compiled functions derived from the subgraph. This will be a list with one function in case the graph was not split.
         is_split (bool): Indicates whether the subgraph has been split. This happens if there was a thunder unsupported functionality.
         split_reasons (list[SplitReason] | None): Optional list of reasons explaining why the subgraph was split. Defaults to None. Present only if `is_split` is True.
         split_graph_module (torch.fx.GraphModule | None): Optional. The graph module for the split subgraph. Defaults to None. Present only if `is_split` is True.
     """
 
     original_graph_module: torch.fx.GraphModule
-    compiled_functions: list[CompiledFunctions]
+    compiled_functions: list[CompiledFunction]
     is_split: bool
     split_reasons: list | None = None
     split_graph_module: torch.fx.GraphModule | None = None

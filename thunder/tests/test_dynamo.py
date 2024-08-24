@@ -41,9 +41,13 @@ def test_basic(executor, device: str, dtype: dtypes.dtype, dynamic: bool | None)
     # assert last_traces(thunder_func)
 
 
-def test_basic_splitter():
-    dynamic = False
-    x = torch.ones(2, 2, requires_grad=True)
+@instantiate(
+    dtypes=NOTHING,
+    executors=[DynamoThunderExecutor],
+    decorators=(pytest.mark.parametrize("dynamic", (True, False, None), ids=("dynamic", "static", "auto")),),
+)
+def test_basic_splitter(executor, device: str, dtype: dtypes.dtype, dynamic: bool | None):
+    x = torch.ones(2, 2, device=device, dtype=dtype, requires_grad=True)
 
     backend = ThunderCompiler()
 
@@ -62,9 +66,13 @@ def test_basic_splitter():
     torch.testing.assert_close(actual_grad, expected_grad)
 
 
-def test_splitter_unsupported_ctx():
-    dynamic = False
-    x = torch.rand(2, 2, requires_grad=True)
+@instantiate(
+    dtypes=NOTHING,
+    executors=[DynamoThunderExecutor],
+    decorators=(pytest.mark.parametrize("dynamic", (True, False, None), ids=("dynamic", "static", "auto")),),
+)
+def test_splitter_unsupported_ctx(executor, device: str, dtype: dtypes.dtype, dynamic: bool | None):
+    x = torch.rand(2, 2, device=device, dtype=dtype, requires_grad=True)
 
     backend = ThunderCompiler()
 
@@ -86,9 +94,13 @@ def test_splitter_unsupported_ctx():
     torch.testing.assert_close(actual_grad, expected_grad)
 
 
-def test_splitter_unsupported_ctx_with_graph_break():
-    dynamic = False
-    x = torch.rand(2, 2, requires_grad=True)
+@instantiate(
+    dtypes=NOTHING,
+    executors=[DynamoThunderExecutor],
+    decorators=(pytest.mark.parametrize("dynamic", (True, False, None), ids=("dynamic", "static", "auto")),),
+)
+def test_splitter_unsupported_ctx_with_graph_break(executor, device: str, dtype: dtypes.dtype, dynamic: bool | None):
+    x = torch.rand(2, 2, device=device, dtype=dtype, requires_grad=True)
 
     backend = ThunderCompiler()
 
