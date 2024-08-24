@@ -30,24 +30,32 @@ def _warn_thunder_compiler():
 
 
 class CompilerType(Enum):
+    """
+    An enumeration representing different types of compilers.
+
+    Attributes:
+        THUNDER: Represents the `thunder.jit`.
+        TORCH_INDUCTOR: Represents the `torch.compile(backend="inductor")`.
+    """
+
     THUNDER = auto()
     TORCH_INDUCTOR = auto()
 
 
 @dataclasses.dataclass
 class CompiledFunction:
+    """
+    A dataclass representing a compiled function along with its original graph module and compiler type.
+
+    Attributes:
+        original_graph_module (torch.fx.GraphModule): The original graph module from which the function is compiled.
+        compiled_fn (Callable): The compiled function.
+        compiler (CompilerType): The type of compiler used to compile the function.
+    """
+
     original_graph_module: torch.fx.GraphModule
     compiled_fn: Callable
     compiler: CompilerType
-
-
-@dataclasses.dataclass
-class SubgraphInfo:
-    original_graph_module: torch.fx.GraphModule
-    compiled_functions: list["CompiledFunctions"]
-    is_split: bool
-    split_reasons: list | None = None
-    split_graph_module: torch.fx.GraphModule | None = None
 
 
 class SplitReasonType(Enum):
@@ -62,6 +70,26 @@ class SplitReason:
     type: SplitReasonType
     info: str | None
     exception: Exception | None = None
+
+
+@dataclasses.dataclass
+class SubgraphInfo:
+    """
+    A dataclass containing information about a subgraph.
+
+    Attributes:
+        original_graph_module (torch.fx.GraphModule): The original graph module.
+        compiled_functions (list[CompiledFunctions]): A list of compiled functions derived from the subgraph. This will be a list with one function in case the graph was not split.
+        is_split (bool): Indicates whether the subgraph has been split. This happens if there was a thunder unsupported functionality.
+        split_reasons (list[SplitReason] | None): Optional list of reasons explaining why the subgraph was split. Defaults to None. Present only if `is_split` is True.
+        split_graph_module (torch.fx.GraphModule | None): Optional. The graph module for the split subgraph. Defaults to None. Present only if `is_split` is True.
+    """
+
+    original_graph_module: torch.fx.GraphModule
+    compiled_functions: list[CompiledFunctions]
+    is_split: bool
+    split_reasons: list | None = None
+    split_graph_module: torch.fx.GraphModule | None = None
 
 
 def try_execute_symbol(thunder_symbol, node) -> tuple[bool, SplitReason | None]:
@@ -112,7 +140,12 @@ class ThunderOperatorSupport:
         self.split_reasons: list[SplitReason] = []
 
     def find_unsupported_ctx_regions(self, gm):
-        ctx_cnt = 0
+        # NOTE - Currently only detects the autocast regions.
+
+        ctx_cnt = 0  # Count of `enters_autocast` we have seen till now
+
+        # We want to mark nodes with `_enter_autocast` and `_exit_autocast`
+        # as unsupported as `thunder` doesn't correctly deal with these stateful functions.
         for node in gm.graph.nodes:
             if node.op == "call_function" and node.target in (torch.amp.autocast_mode._enter_autocast,):
                 ctx_cnt += 1
@@ -123,6 +156,10 @@ class ThunderOperatorSupport:
                     self.unsupported_nodes.add(node)
 
     def is_node_supported(self, submodules: Mapping[str, torch.nn.Module], node: torch.fx.Node):
+        """
+        Determine whether thunder can execute the operation described by this node.
+        """
+        # These are the nodes which are in unsupported context regions
         if node in self.unsupported_nodes:
             self.split_reasons.append(
                 SplitReason(
@@ -132,16 +169,19 @@ class ThunderOperatorSupport:
             )
             return False
 
-        target = node.target
+        target = node.target  # Target is the function to call.
         if node.op == "call_method":
             self_arg = node.args[0]
             target = getattr(torch.Tensor, node.target, None)
             assert target is not None, f"Failed to find method {node.target}"
 
+        # We assume this works!
         if target in (operator.add, operator.sub, operator.mul, operator.getitem, operator.gt, operator.lt):
             # Example - x: "f32[2]" = l_x_ + 2;  l_x_ = None
             return True
 
+        # If the operation has automatic registration, we mark it as unsupported as `inductor` might be
+        # able to deal with it better.
         if target in auto_register_ops:
             self.split_reasons.append(
                 SplitReason(
@@ -151,16 +191,20 @@ class ThunderOperatorSupport:
             )
             return False
 
+        # If thunder has a mapping for this operation, try executing the meta function and see.
+        # We have a symbol for `torch.where`, but we don't support one overload of it.
+        # So, we try and execute the meta to get a real signal.
         if target in _torch_to_thunder_function_map:
             if target in [torch.ones]:  # Factory functions.
                 return True
 
             thunder_symbol = _torch_to_thunder_function_map[target]
             did_run, opt_split_reason = try_execute_symbol(thunder_symbol, node)
-            if not did_run:
+            if opt_split_reason is not None:
                 self.split_reasons.append(opt_split_reason)
             return did_run
 
+        # We found no automatic fallback registration and no mapping to thunder symbol.
         self.split_reasons.append(
             SplitReason(
                 SplitReasonType.MISSING_OP_SUPPORT,
@@ -243,11 +287,14 @@ class ThunderCompiler:
             return partition_cnt
 
         split_module = fx_split_module(gm, None, callback, keep_original_order=True, keep_original_node_name=True)
+
+        def is_thunder_supported_partition(node: torch.fx.Node):
+            return node.name.startswith("submod") and int(node.name.replace("submod_", "")) in supported_partitions
+
+        # Call compile on the split regions.
         compiled_funcs = []
         for node in split_module.graph.nodes:
-            if (
-                node.name.startswith("submod") and int(node.name.replace("submod_", "")) in supported_partitions
-            ):  # For thunder
+            if is_thunder_supported_partition(node):
                 graph_module = getattr(split_module, node.name)
                 jit_fn = self.thunder_jit(graph_module)
                 setattr(split_module, node.name, jit_fn)
@@ -258,6 +305,9 @@ class ThunderCompiler:
                 setattr(split_module, node.name, jit_fn)
                 compiled_funcs.append(CompiledFunction(graph_module, jit_fn, CompilerType.TORCH_INDUCTOR))
 
+            # Everything else is a glue code to call and pass outputs between the other partitions.
+
+        # Append the details regarding this graph/subgraph.
         self.subgraph_infos.append(SubgraphInfo(gm, compiled_funcs, True, operator_support.split_reasons, split_module))
         # pprint.pprint(self.subgraph_infos[-1].split_reasons)
         return split_module
@@ -279,8 +329,7 @@ class ThunderCompiler:
         #     self.subgraph_infos.append(SubgraphInfo(gm, [compiled_fn], False))
         #     return jitted_gm
 
-        # The whole graph is not supported by `thunder`, so we split it in `thunder` supported sections
+        # The whole graph may not be supported by `thunder`, so we split it in `thunder` supported sections
         # and unsupported sections which are passed to `torch.compile(backend='inductor')`
-        # split_module = capability_partitioner_splitter(gm, sample_args)
         split_module = self.splitter(gm, sample_args)
         return split_module
