@@ -185,6 +185,25 @@ class ThunderOperatorSupport:
             )
             return False
 
+        # Docs from the torch.fx.Node - https://pytorch.org/docs/stable/fx.html#torch.fx.Node
+        # Each Node has a function specified by its op property
+        # Below are the details for the ones this function is interested in -
+        # `call_function` applies a free function to some values.
+        #       name is similarly the name of the value to assign to.
+        #       target is the function to be applied. args and kwargs represent
+        #       the arguments to the function, following the Python calling convention
+        # `call_method` calls a method on a value.
+        #       name is as similar.
+        #       target is the string name of the method to apply to the self argument.
+        #       args and kwargs represent the arguments to invoke the module on, including the self argument
+        #
+        # NOTE: `call_module` should be inlined in dynamo graphs since https://github.com/pytorch/pytorch/pull/131275
+        # But there is flag to disable inlining `call_module`. Determining `call_module` support would actually require calling `thunder.jit` on it.
+        #
+        # `call_module` applies a module in the module hierarchy’s forward() method to given arguments.
+        #       name is as previous. target is the fully-qualified name of the module in the module hierarchy to call.
+        #       args and kwargs represent the arguments to invoke the module on, excluding the self argument
+
         target = node.target  # Target is the function to call.
         if node.op == "call_method":
             self_arg = node.args[0]
@@ -234,6 +253,7 @@ def _all_graph_supported_by_thunder(gm: torch.fx.GraphModule, sample_input: list
     """
     Determine whether there is any thunder unsupported operation.
     """
+    # NOTE - Unused for now.
     op_support = ThunderOperatorSupport(gm)
     supported = True
     for node in gm.graph.nodes:
@@ -280,7 +300,7 @@ class ThunderCompiler:
         self.subgraph_infos: list[SubgraphInfo] = []
 
         self.thunder_options = thunder_options
-        self.thunder_jit = partial(jit, **thunder_options)
+        self._thunder_jit = partial(jit, **thunder_options)
 
     def splitter(
         self, gm: torch.fx.GraphModule, _unused_sample_args: list[torch.SymInt, torch.Tensor]
@@ -355,6 +375,11 @@ class ThunderCompiler:
         supported_partitions = set()
 
         def callback(node) -> int:
+            assert node.op not in (
+                "placeholder",
+                "get_attr",
+                "output",
+            ), f"fx.split_module should have only passed node.op=call_* but received {node.op}"
             nonlocal prev_value, partition_cnt
             is_thunder_supported = operator_support.is_node_supported(gm, node)
             if prev_value == is_thunder_supported:  # We are in the same region.
@@ -381,7 +406,7 @@ class ThunderCompiler:
         for node in split_module.graph.nodes:
             if is_thunder_supported_partition(node):
                 graph_module = getattr(split_module, node.name)
-                jit_fn = self.thunder_jit(graph_module)
+                jit_fn = self._thunder_jit(graph_module)
                 setattr(split_module, node.name, jit_fn)
                 comipled_fn.append(CompiledFunction(graph_module, jit_fn, CompilerType.THUNDER))
             elif node.name.startswith("submod"):  # For inductor
