@@ -350,7 +350,11 @@ def test_nanogpt_cross_entropy(benchmark, executor: None | Callable, compute_typ
     ),
     ids=("bs1", "bs2"),
 )
-@parametrize_compute_type
+@pytest.mark.parametrize(
+    "compute_type,",
+    (ComputeType.TRAINING_FORWARD, ComputeType.TRAINING_BACKWARD),
+    ids=("forward", "backward"),
+)
 @pytest.mark.parametrize(
     "config,",
     IMPORTANT_CONFIGS,
