@@ -2667,6 +2667,90 @@ class LitGPTSDPABenchmark(NanoGPTSDPABenchmark):
         return (q, k, v), {"dropout": 0.0}  # no litgpt model uses dropout
 
 
+class LitGPTCrossEntropyBenchmark(Benchmark, metaclass=UserFacingBenchmarkMeta):
+    _args = (
+        BenchmarkArg(
+            name="config",
+            description="The LitGPT config (str) to use.",
+        ),
+        BenchmarkArg(
+            name="batchdims",
+            description="The shape (Sequence[int]) of input batch dimensions. The input will have innermost dimensions of (config.seq_len, config.vocab_size). Default is (16,).",
+        ),
+        BenchmarkArg(
+            name="indices_dtype",
+            description="The dtype (thunder.dtypes.dtype, torch.dtype, or str) of the input and targets. Default is thunder.int64.",
+        ),
+        BenchmarkArg(
+            name="device",
+            description="A device (str) to run on. Default is 'cuda'.",
+        ),
+        BenchmarkArg(
+            name="dtype",
+            description="The dtype (thunder.dtypes.dtype, torch.dtype, or str) of the logits. Default is thunder.float32.",
+        ),
+        BenchmarkArg(
+            name="requires_grad",
+            description="Whether the logits require grad. Default is False.",
+        ),
+    )
+
+    @classmethod
+    @property
+    def name(cls) -> str:
+        return "litgpt-cross-entropy"
+
+    @classmethod
+    @property
+    def description(cls) -> str:
+        return "Lit-GPT's CrossEntropy call."
+
+    def __init__(
+        self,
+        config: str,
+        batchdims: Sequence[int] = (16,),
+        device: str = "cuda",
+        dtype: dtypes.dtype = thunder.bfloat16,
+        requires_grad: bool = True,
+    ) -> None:
+        from thunder.tests.litgpt_model import Config
+
+        self.config = Config.from_name(config)
+
+        self.batchdims = batchdims
+        self.device = device
+        self.dtype = dtype
+        self.requires_grad: bool = requires_grad
+
+        # Performs torch dtype conversions
+        self.tdtype: torch.dtype = ltorch.to_torch_dtype(self.dtype)
+        self.indices_tdtype = torch.int64
+
+        # Sets required benchmark parameters
+        self.devices: list[str] = [device]
+
+    def make_batch(self) -> tuple[list, dict]:
+        make = partial(make_tensor, low=0, high=255, device=self.device, requires_grad=self.requires_grad)
+
+        logits_shape = self.batchdims + (self.config.block_size, self.config.vocab_size)
+        logits = make(logits_shape, dtype=self.tdtype)
+
+        targets_shape = self.batchdims + (self.config.block_size,)
+        targets = make(targets_shape, dtype=self.indices_tdtype, requires_grad=False)
+
+        return (logits.view(-1, logits.size(-1)), targets.view(-1)), {}
+
+    def fn(self) -> Callable:
+        def apply_cross_entropy(logits, targets):
+            return torch.nn.functional.cross_entropy(
+                logits,
+                targets,
+                ignore_index=-1,
+            )
+
+        return apply_cross_entropy
+
+
 # Taken from HuggingFace Bart-Large model config:
 # https://huggingface.co/facebook/bart-large/blob/main/config.json
 class HuggingFaceSelfAttnBenchmark(Benchmark, metaclass=UserFacingBenchmarkMeta):

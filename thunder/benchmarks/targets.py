@@ -19,6 +19,7 @@ from thunder.benchmarks import (
     LitGPTCausalSelfAttentionBenchmark,
     LitGPTSDPABenchmark,
     LitGPTSwigluBenchmark,
+    LitGPTCrossEntropyBenchmark,
     LlamaMLPBenchmark,
     NanoGPTBenchmark,
     NanoGPTCrossEntropyBenchmark,
@@ -328,6 +329,38 @@ def test_nanogpt_cross_entropy(benchmark, executor: None | Callable, compute_typ
 
     bench: Benchmark = NanoGPTCrossEntropyBenchmark(
         config="gpt2-xl", device="cuda:0", dtype=thunder.bfloat16, requires_grad=is_requires_grad(compute_type)
+    )
+
+    args, kwargs = bench.make_batch()
+    fn = executor(bench.fn())
+
+    benchmark_for_compute_type(compute_type, benchmark, fn, args, kwargs)
+
+
+@pytest.mark.parametrize(
+    "executor,",
+    (executors + apex_executors),
+    ids=(executors_ids + apex_executors),
+)
+@pytest.mark.parametrize(
+    "bs,",
+    (
+        1,
+        2,
+    ),
+    ids=("bs1", "bs2"),
+)
+@parametrize_compute_type
+@pytest.mark.parametrize(
+    "config,",
+    IMPORTANT_CONFIGS,
+)
+def test_litgpt_cross_entropy(benchmark, executor: None | Callable, bs, compute_type: ComputeType, config):
+    if executor is None:
+        pytest.skip("Executor is unavailable")
+
+    bench: Benchmark = LitGPTCrossEntropyBenchmark(
+        config, device="cuda:0", dtype=thunder.bfloat16, requires_grad=is_requires_grad(compute_type), batchdims=(bs,)
     )
 
     args, kwargs = bench.make_batch()
