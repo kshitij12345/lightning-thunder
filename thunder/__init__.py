@@ -293,6 +293,7 @@ def jit(
 
     Args:
         fn: A :class:`~torch.nn.Module` or a function to compile.
+
     Keyword Args:
         langctx: the language context, which language / library to emulate. default: "torch" for PyTorch compatibility.
         executors: list of executors to use. Defaults to the executors returned by :func:`thunder.extend.get_default_executors` and always amended by :func:`thunder.extend.get_always_executors`.
