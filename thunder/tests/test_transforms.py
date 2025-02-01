@@ -855,3 +855,32 @@ def test_cache_symbolic_values_grad_unsqueeze():
     expected.sum().backward()
     assert_close(actual, expected)
     assert_close(a.grad, a_ref.grad)
+
+
+def test_stream_parallel():
+    def fn(t0s, a):
+        for t0 in t0s:
+            t1 = torch.sin(t0)
+            del t0
+            t2 = t1.cos()
+            a = torch.matmul(t2, a)
+            del t1
+            # t3 = torch.nn.functional.sin(t2); del t2
+            # a = torch.matmul(t3, a); del t3
+        return a
+
+    N_PARALLEL_PATHS = 3
+    t0s = [torch.randn(256, 256, device="cuda") for _ in range(N_PARALLEL_PATHS)]  # 0.25 MiB * N_PARALLEL_PATHS
+    a = torch.randn(256, 256, device="cuda")  # 0.25 MiB
+
+    import thunder
+
+    jfn = thunder.jit(fn)
+    expected = jfn(t0s, a)
+
+    from thunder.transforms.stream_parallelization import StreamParallelization
+
+    njfn = thunder.jit(fn, transforms=[StreamParallelization()])
+    actual = njfn(t0s, a)
+
+    torch.testing.assert_close(actual, expected)
