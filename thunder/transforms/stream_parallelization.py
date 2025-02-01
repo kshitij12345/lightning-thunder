@@ -270,8 +270,8 @@ class StreamParallelization(thunder.Transform):
                 for path in nx.all_simple_paths(G, node.ID, sink):
                     paths.append(path)
 
-        for path in paths:
-            print(path)
+        # for path in paths:
+        #     print(path)
 
         stream_map = {}
         node_to_streams_map = defaultdict(set)
@@ -282,7 +282,7 @@ class StreamParallelization(thunder.Transform):
                     stream_map[node] = processor_cnt
             processor_cnt += 1
 
-        print(stream_map)
+        # print(stream_map)
 
         # find sync nodes
         for node in G.nodes():
@@ -292,7 +292,7 @@ class StreamParallelization(thunder.Transform):
             else:
                 node_to_streams_map[node].add(stream_map[node])
 
-        print(node_to_streams_map)
+        # print(node_to_streams_map)
 
         topological_nodes = list(nx.topological_sort(G))
 
@@ -314,12 +314,12 @@ class StreamParallelization(thunder.Transform):
             for cnt, idx in enumerate(nodes_in_path):
                 topological_nodes.insert(start_idx + 1 + cnt, topological_nodes.pop(idx))
 
-        print(topological_nodes)
+        # print(topological_nodes)
 
         stream_ex = OperatorExecutor("stream_ex")
 
         def sync_with_default_and_set_new_stream_impl(new_stream: torch.cuda.Stream):
-            new_stream.wait_stream(torch.cuda.current_stream())
+            # new_stream.wait_stream(torch.cuda.current_stream())
             torch.cuda.set_stream(new_stream)
 
         sync_with_default_and_set_new_stream = stream_ex.register_operator(
