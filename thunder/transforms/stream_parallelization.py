@@ -267,7 +267,7 @@ class StreamParallelization(thunder.Transform):
         paths = []
         for bsym_id, node in enumerate(g.bsym_id_to_node_map):
             if len(node.parents) == 0:  # roots
-                for path in nx.all_simple_paths(G, node.ID, 10):
+                for path in nx.all_simple_paths(G, node.ID, sink):
                     paths.append(path)
 
         for path in paths:
