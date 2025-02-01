@@ -399,4 +399,4 @@ class StreamParallelization(thunder.Transform):
 
         # print(new_trace)
         # return new_trace
-        return computation_trace
+        return new_trace
