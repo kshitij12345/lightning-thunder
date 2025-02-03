@@ -15,6 +15,7 @@ from thunder.core.proxies import variableify, Proxy, AnyProxy
 import thunder.core.prims as prims
 from thunder.core.prims import PrimIDs
 from thunder.executors import torchex
+import thunder.executors
 from thunder.extend import OperatorExecutor
 
 
@@ -319,8 +320,9 @@ class StreamParallelization(thunder.Transform):
         stream_ex = OperatorExecutor("stream_ex")
 
         def sync_with_default_and_set_new_stream_impl(new_stream: torch.cuda.Stream):
-            # new_stream.wait_stream(torch.cuda.current_stream())
+            new_stream.wait_stream(torch.cuda.current_stream())
             torch.cuda.set_stream(new_stream)
+            # pass
 
         sync_with_default_and_set_new_stream = stream_ex.register_operator(
             "sync_with_default_and_set_new_stream",
@@ -330,6 +332,7 @@ class StreamParallelization(thunder.Transform):
 
         def set_default_stream_impl():
             torch.cuda.set_stream(torch.cuda.default_stream())
+            # pass
 
         set_default_stream = stream_ex.register_operator(
             "set_default_stream", meta=lambda: None, fn=set_default_stream_impl
@@ -338,6 +341,7 @@ class StreamParallelization(thunder.Transform):
         def sync_with_default_stream_and_set_default_stream_impl(new_stream: torch.cuda.Stream):
             torch.cuda.default_stream().wait_stream(new_stream)
             torch.cuda.set_stream(torch.cuda.default_stream())
+            # pass
 
         sync_with_default_stream_and_set_default_stream = stream_ex.register_operator(
             "sync_with_default_stream_and_set_default_stream",
@@ -397,6 +401,6 @@ class StreamParallelization(thunder.Transform):
         for bsym in new_nodes_with_syncs:
             new_trace.add_bound_symbol(bsym)
 
-        # print(new_trace)
+        new_trace = thunder.executors.passes.del_last_used(new_trace)
         # return new_trace
         return new_trace
