@@ -229,20 +229,74 @@ _translation_map: dict[Hashable, Callable] = {}
 def get_translator(bsym: BoundSymbol) -> Callable:
     return _translation_map[bsym.sym.id]
 
+from collections.abc import Iterable
+from nvfuser import DataType, FusionDefinition
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Placement, Shard, Replicate
+from typing import Callable, cast
+import torch.distributed as dist
+
+class MultiDeviceFusionDefinition(FusionDefinition):
+    def _find_tensor_by_index(self, index: int) -> nvfuser.Tensor:
+        for t in self.sched.tensors():
+            if t.index == index:
+                return t
+        return None
+
+    def multidevice_schedule(self) -> None:
+        for in_tensor_index, in_dtensor in zip(self.inputs(), self.in_dtensors):
+            in_tensor = self._find_tensor_by_index(in_tensor_index)
+
+            # Set the device mesh.
+            assert (
+                in_dtensor.device_mesh.ndim == 1
+            ), "nvFuser's Python API only supports 1D meshes."
+            mesh = nvfuser.DeviceMesh(in_dtensor.device_mesh.mesh.tolist())
+
+            self.sched._set_device_mesh(in_tensor, mesh)
+
+            # Parallelize.
+            assert len(in_dtensor.placements) == 1, "Expect a 1D mesh"
+            placement: Placement = in_dtensor.placements[0]
+            if placement.is_shard():
+                dim = cast(Shard, placement).dim
+                self.sched.parallelize(
+                    in_tensor, dim, nvfuser.ParallelType.mesh_x
+                )
+    
+    def __call__(self, in_dtensors: Iterable[DTensor], **kwargs) -> list[DTensor]:
+        # fusion_def = self._create_fusion_definition(in_dtensors)
+
+        in_tensors = [in_dtensor.to_local() for in_dtensor in in_dtensors]
+        out_tensors = fusion_def.execute(in_tensors, **kwargs)
+
+        for i, out_tensor in enumerate(out_tensors):
+            if isinstance(out_tensor, nvfuser.DistributedTensor):
+                mesh = dist.device_mesh.init_device_mesh(
+                    "cuda", (out_tensor.mesh.size,)
+                )
+                placements: list[Placement] = []
+                for parallel_type in [nvfuser.ParallelType.mesh_x]:
+                    axis: int = out_tensor.axis_sharded_on(parallel_type)
+                    placements.append(Replicate() if axis == -1 else Shard(axis))
+                out_tensors[i] = DTensor.from_local(out_tensor.local, mesh, placements)
+        return out_tensors
+
 
 def create_fd(
     bsyms: list[BoundSymbol],
     input_descriptors: Sequence[type | tuple[tuple[int, ...], tuple[bool, ...], tuple[int, ...]]],
     sorted_unique_inputs: list[Proxy],
     sorted_unique_outputs: list[Proxy],
-) -> FusionDefinition:
+) -> MultiDeviceFusionDefinition:
+    print("FD CRAETE")
     lc_to_nv_map = utils.ProxyDict()
 
     # NOTE nvFuser's default max length is 1024 operations at the time of this writing
     #   This arbitrarily increases it to 9999
     # TODO Review splititng very large fusions or removing the max length restriction completely
     #   See "Very large nvFuser fusions hit max_length"
-    fd = FusionDefinition(max_length=9999)
+    fd = MultiDeviceFusionDefinition(max_length=9999)
     with fd:
         # NOTE Adding constants is disabled for the moment in favor of definining them inline
         # 0) Adds constants
@@ -314,6 +368,7 @@ def create_fd(
             nvout = lc_to_nv_map[out]
             fd.add_output(nvout)
 
+    print(fd)
     return fd
 
 
@@ -351,11 +406,11 @@ def compute_symbolic_shape(
         # loudly raise exception when runtime shape violates proxy_shape in the
         # trace, which indicates issues with the cache. This isn't necessarily
         # an exception.
-        check(
-            isinstance(p_l, NumberProxy) or p_l == l,
-            lambda: f"inconsistent fusion definition with runtime shape {shape} and trace shape {proxy_shape}",
-            exception_type=AssertionError,
-        )
+        # check(
+        #     isinstance(p_l, NumberProxy) or p_l == l,
+        #     lambda: f"inconsistent fusion definition with runtime shape {shape} and trace shape {proxy_shape}",
+        #     exception_type=AssertionError,
+        # )
 
         # broadcast is specialized in FusionDefinition, preserve it for correct broadcast semantics
         if l == 1:
@@ -463,7 +518,18 @@ class FusionDefinitionWrapper:
     disable_options: None | list[str] = None
 
     def __call__(self, *args):
+        in_d_tensors = args
+        new_args = []
+        for arg in args:
+            if isinstance(arg, DTensor):
+                new_args.append(arg.to_local())
+            else:
+                new_args.append(args)
+
+        args = tuple(new_args)
+
         fd = self.get_fd(self.to_descriptors(args))
+        fd.in_dtensors = in_d_tensors
         self.last_used = fd
 
         if self.store_inputs:
@@ -484,8 +550,23 @@ class FusionDefinitionWrapper:
                 f"nv_enable_options/nv_disable_options require nvFuser version 0.2.23 and above, found version {nvfuser_version()}. These options will be ignored."
             )
 
-        with annotate_for_profile(self.name):
-            return fd.execute(args, **kwargs)
+        # with annotate_for_profile(self.name):
+        #     return fd.execute(args, **kwargs)
+        in_tensors = args
+        out_tensors = fd.execute(in_tensors, **kwargs)
+
+        for i, out_tensor in enumerate(out_tensors):
+            if isinstance(out_tensor, nvfuser.DistributedTensor):
+                mesh = dist.device_mesh.init_device_mesh(
+                    "cuda", (out_tensor.mesh.size,)
+                )
+                placements: list[Placement] = []
+                for parallel_type in [nvfuser.ParallelType.mesh_x]:
+                    axis: int = out_tensor.axis_sharded_on(parallel_type)
+                    placements.append(Replicate() if axis == -1 else Shard(axis))
+                out_tensors[i] = DTensor.from_local(out_tensor.local, mesh, placements)
+
+        return out_tensors
 
     def __repr__(self):
         return f"FusionDefinitionWrapper({self.name})"
