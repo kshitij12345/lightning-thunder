@@ -16,24 +16,27 @@ hidden_size = 16
 def model(x, w, b):
     return torch.nn.functional.linear(x, w)
 
-# weight = nn.Parameter(distribute_tensor(torch.randn(16, 16), mesh, [Shard(0)]))
-# bias = nn.Parameter(distribute_tensor(torch.randn(16), mesh, [Shard(0)]))
+weight = nn.Parameter(distribute_tensor(torch.randn(16, 16, requires_grad=True), mesh, [Shard(0)]))
+bias = nn.Parameter(distribute_tensor(torch.randn(16, requires_grad=True), mesh, [Shard(0)]))
 
-# in_dtensor = distribute_tensor(torch.randn(4, 16), mesh, [Replicate()])
+in_dtensor = distribute_tensor(torch.randn(4, 16, requires_grad=True), mesh, [Replicate()])
 
-# expected = torch.compile(model)(in_dtensor, weight, bias)
-# actual = thunderfx(model, nv_enable_matmul=True, nv_enable_linear=True)(in_dtensor, weight, bias)
+expected = torch.compile(model)(in_dtensor, weight, bias)
+actual = thunderfx(model, nv_enable_matmul=True, nv_enable_linear=True)(in_dtensor, weight, bias)
 
-def model(x):
-    return x + 1
+# def model(x):
+#     return x + 1
 
-in_tensor = torch.randn(num_devices, 4)
-mesh = dist.device_mesh.init_device_mesh("cuda", [num_devices])
-in_dtensor = dist.tensor.distribute_tensor(in_tensor, mesh, [Shard(0)])
+# in_tensor = torch.randn(num_devices, 4)
+# mesh = dist.device_mesh.init_device_mesh("cuda", [num_devices])
+# in_dtensor = dist.tensor.distribute_tensor(in_tensor, mesh, [Shard(0)])
 
-print(in_dtensor.shape)
+# print(in_dtensor.shape)
 
-expected = torch.compile(model)(in_dtensor)
-actual = thunderfx(model, nv_enable_matmul=True, nv_enable_linear=True)(in_dtensor)
+# expected = torch.compile(model)(in_dtensor)
+# actual = thunderfx(model, nv_enable_matmul=True, nv_enable_linear=True)(in_dtensor)
 
 torch.testing.assert_close(actual.to_local(), expected.to_local())
+
+# actual_g = torch.autograd.grad(actual, (in_dtensor, weight), torch.ones_like(actual),)
+# expected_g = torch.autograd.grad(expected, (in_dtensor, weight), torch.ones_like(actual),)
