@@ -170,6 +170,7 @@ def _splitter(
             placeholders = list(n for n in graph_module.graph.nodes if n.op == "placeholder")
 
             # Doesn't work with DTensor.
+            # [rank0]: NotImplementedError: Operator aten.aminmax.default does not have a sharding strategy registered.
             # example_input_metadata = map(
             #     partial(_get_example_inputs_from_placeholder, only_metadata=True), placeholders
             # )

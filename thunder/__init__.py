@@ -440,7 +440,10 @@ def jit(
         # alaises wouldn't matter, thus it'd be better to nullify this entry in such cases.
         # It however would require the functionalized computation trace to interact with `cache_info`,
         # which seems to break the consistency of cache_info, leading to a failure in cache_info check.
-        cache_info["alias_tensor_indices"] = "" # _alias_tensor_of_args_kwargs(*args, **kwargs)  # Doesn't work with DTensor.
+
+        # Doesn't work with DTensor.
+        # RuntimeError: Attempted to access the data pointer on an invalid python storage. (data_ptr access on TensorSubclass)
+        cache_info["alias_tensor_indices"] = "" # _alias_tensor_of_args_kwargs(*args, **kwargs)
 
         # Store the `is_grad_enabled` state of PyTorch. This is used by vjp transform
         # to treat certain Symbols as constant.
