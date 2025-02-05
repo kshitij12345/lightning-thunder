@@ -265,10 +265,8 @@ class MultiDeviceFusionDefinition(FusionDefinition):
                 )
     
     def __call__(self, in_dtensors: Iterable[DTensor], **kwargs) -> list[DTensor]:
-        # fusion_def = self._create_fusion_definition(in_dtensors)
-
         in_tensors = [in_dtensor.to_local() for in_dtensor in in_dtensors]
-        out_tensors = fusion_def.execute(in_tensors, **kwargs)
+        out_tensors = self.execute(in_tensors, **kwargs)
 
         for i, out_tensor in enumerate(out_tensors):
             if isinstance(out_tensor, nvfuser.DistributedTensor):
@@ -289,7 +287,6 @@ def create_fd(
     sorted_unique_inputs: list[Proxy],
     sorted_unique_outputs: list[Proxy],
 ) -> MultiDeviceFusionDefinition:
-    print("FD CRAETE")
     lc_to_nv_map = utils.ProxyDict()
 
     # NOTE nvFuser's default max length is 1024 operations at the time of this writing
@@ -368,7 +365,6 @@ def create_fd(
             nvout = lc_to_nv_map[out]
             fd.add_output(nvout)
 
-    print(fd)
     return fd
 
 
@@ -406,11 +402,11 @@ def compute_symbolic_shape(
         # loudly raise exception when runtime shape violates proxy_shape in the
         # trace, which indicates issues with the cache. This isn't necessarily
         # an exception.
-        # check(
-        #     isinstance(p_l, NumberProxy) or p_l == l,
-        #     lambda: f"inconsistent fusion definition with runtime shape {shape} and trace shape {proxy_shape}",
-        #     exception_type=AssertionError,
-        # )
+        check(
+            isinstance(p_l, NumberProxy) or p_l == l,
+            lambda: f"inconsistent fusion definition with runtime shape {shape} and trace shape {proxy_shape}",
+            exception_type=AssertionError,
+        )
 
         # broadcast is specialized in FusionDefinition, preserve it for correct broadcast semantics
         if l == 1:
@@ -518,18 +514,10 @@ class FusionDefinitionWrapper:
     disable_options: None | list[str] = None
 
     def __call__(self, *args):
-        in_d_tensors = args
-        new_args = []
-        for arg in args:
-            if isinstance(arg, DTensor):
-                new_args.append(arg.to_local())
-            else:
-                new_args.append(args)
-
-        args = tuple(new_args)
-
         fd = self.get_fd(self.to_descriptors(args))
-        fd.in_dtensors = in_d_tensors
+
+        # MultiDeviceFusionDefinition uses it. Do it gracefully.
+        fd.in_dtensors = args
         self.last_used = fd
 
         if self.store_inputs:
@@ -550,23 +538,8 @@ class FusionDefinitionWrapper:
                 f"nv_enable_options/nv_disable_options require nvFuser version 0.2.23 and above, found version {nvfuser_version()}. These options will be ignored."
             )
 
-        # with annotate_for_profile(self.name):
-        #     return fd.execute(args, **kwargs)
-        in_tensors = args
-        out_tensors = fd.execute(in_tensors, **kwargs)
-
-        for i, out_tensor in enumerate(out_tensors):
-            if isinstance(out_tensor, nvfuser.DistributedTensor):
-                mesh = dist.device_mesh.init_device_mesh(
-                    "cuda", (out_tensor.mesh.size,)
-                )
-                placements: list[Placement] = []
-                for parallel_type in [nvfuser.ParallelType.mesh_x]:
-                    axis: int = out_tensor.axis_sharded_on(parallel_type)
-                    placements.append(Replicate() if axis == -1 else Shard(axis))
-                out_tensors[i] = DTensor.from_local(out_tensor.local, mesh, placements)
-
-        return out_tensors
+        with annotate_for_profile(self.name):
+            return fd(args, **kwargs)
 
     def __repr__(self):
         return f"FusionDefinitionWrapper({self.name})"
