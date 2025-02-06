@@ -168,7 +168,6 @@ def _splitter(
             graph_module = getattr(split_gm, node.name)
             # Record the input tensor metadata of the current module based on the faketensor 'example_value' of the placeholder node
             placeholders = list(n for n in graph_module.graph.nodes if n.op == "placeholder")
-
             example_input_metadata = map(
                 partial(_get_example_inputs_from_placeholder, only_metadata=True), placeholders
             )
