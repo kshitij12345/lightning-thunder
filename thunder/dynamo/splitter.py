@@ -169,12 +169,10 @@ def _splitter(
             # Record the input tensor metadata of the current module based on the faketensor 'example_value' of the placeholder node
             placeholders = list(n for n in graph_module.graph.nodes if n.op == "placeholder")
 
-            # Doesn't work with DTensor.
-            # [rank0]: NotImplementedError: Operator aten.aminmax.default does not have a sharding strategy registered.
-            # example_input_metadata = map(
-            #     partial(_get_example_inputs_from_placeholder, only_metadata=True), placeholders
-            # )
-            # example_input_metadatas.append(list(example_input_metadata))
+            example_input_metadata = map(
+                partial(_get_example_inputs_from_placeholder, only_metadata=True), placeholders
+            )
+            example_input_metadatas.append(list(example_input_metadata))
             # Replace PyTorch operators within the checkpointed function with the corresponding Thunder operators
             checkpoint_converter(split_gm, graph_module)
             jit_fn = thunder_jit(graph_module)

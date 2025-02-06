@@ -13,7 +13,7 @@ mesh = DeviceMesh("cuda", list(range(num_devices)))
 
 hidden_size = 16
 
-def model(x, w, b):
+def model(x, w):
     return torch.nn.functional.linear(x, w)
 
 weight = nn.Parameter(distribute_tensor(torch.randn(16, 16, requires_grad=True), mesh, [Shard(0)]))
@@ -21,8 +21,8 @@ bias = nn.Parameter(distribute_tensor(torch.randn(16, requires_grad=True), mesh,
 
 in_dtensor = distribute_tensor(torch.randn(4, 16, requires_grad=True), mesh, [Replicate()])
 
-expected = torch.compile(model)(in_dtensor, weight, bias)
-actual = thunderfx(model, nv_enable_matmul=True, nv_enable_linear=True)(in_dtensor, weight, bias)
+expected = torch.compile(model)(in_dtensor, weight)
+actual = thunderfx(model, nv_enable_matmul=True, nv_enable_linear=True)(in_dtensor, weight)
 
 # def model(x):
 #     return x + 1
@@ -38,5 +38,6 @@ actual = thunderfx(model, nv_enable_matmul=True, nv_enable_linear=True)(in_dtens
 
 torch.testing.assert_close(actual.to_local(), expected.to_local())
 
-# actual_g = torch.autograd.grad(actual, (in_dtensor, weight), torch.ones_like(actual),)
-# expected_g = torch.autograd.grad(expected, (in_dtensor, weight), torch.ones_like(actual),)
+# g_o = distribute_tensor(torch.ones(4, 16), mesh, [Shard(0)])
+# expected_g = torch.autograd.grad(expected, (in_dtensor, weight), g_o,)
+# actual_g = torch.autograd.grad(actual, (in_dtensor, weight), g_o)
