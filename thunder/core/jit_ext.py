@@ -41,6 +41,7 @@ from thunder.core.proxies import (
     ProxyTag,
     TensorProxy,
     Variable,
+    DTensorProxy,
     is_proxy_name_available,
     proxy,
     unvariableify,
@@ -262,6 +263,9 @@ class JitCtx:
             # TODO: other caching modes
             co: CACHE_OPTIONS = get_cache_option()
             if co is CACHE_OPTIONS.CONSTANT_VALUES:
+                if isinstance(p, DTensorProxy):
+                    # Add check for mesh and layout.
+                    pass
                 self.add_constraint((clang.check_tensor_shape_and_metadata, p))
             elif co is CACHE_OPTIONS.SYMBOLIC_VALUES:
                 # TODO: establish guarding logic to allow non-broadcast shape change
