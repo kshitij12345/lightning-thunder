@@ -141,6 +141,15 @@ check_slice_value = ex.register_operator("check_slice_value", like=prims.check_s
 ex.register_implementation(prims.check_slice_value, check_slice_value, checker=_always_executable)
 
 
+def _check_python_repr_impl(s: object, value: str) -> None:
+    utils.check(repr(s) == value, lambda: f"Expected '{s} to be equal to '{value}")
+
+
+check_python_repr = ex.register_operator("check_python_repr", like=prims.check_python_repr, fn=_check_python_repr_impl)
+
+ex.register_implementation(prims.check_python_repr, check_python_repr, checker=_always_executable)
+
+
 def _unpack_tuple_impl(tup: tuple, /) -> tuple:
     return tup
 

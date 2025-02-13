@@ -530,3 +530,28 @@ def remove_context_manager_prims_from_trace(trace: Trace) -> Trace:
     new_trace.bound_symbols = filtered_bsyms
     new_trace.set_provenance(TraceProvenance("Remove context manager prims"))
     return new_trace
+
+
+def process_dtensor_and_register_bsyms(trace: Trace) -> Trace:
+    from thunder.executors.torchex import ex as torchex, torch
+    from thunder.core.symbol import Symbol
+    from thunder.core.proxies import DTensorProxy
+
+    new_trace = from_trace(trace)
+    new_bsyms = []
+    for bsym in trace.bound_symbols:
+        if isinstance(bsym.sym.id, str) and bsym.sym.id.startswith("torch"):
+            filter_tensor_proxies = list(filter(lambda t: isinstance(t, TensorProxy), bsym.flat_args))
+            if all(map(lambda t: isinstance(t, DTensorProxy), filter_tensor_proxies)):
+                # Using `meta` instead of `like` as that determines the module for the symbol.
+                # TODO: How to integrate with the autograd system??
+                new_symbol = torchex.register_operator(f"dist_{bsym.sym.id}", meta=bsym.sym.meta)
+                torchex.implmap[new_symbol.id] = torchex.implmap[bsym.sym.id]
+                new_bsym = new_symbol.bind(*bsym.args, output=bsym.output)
+                new_bsyms.append(new_bsym)
+        else:
+            new_bsyms.append(bsym)
+
+    new_trace.bound_symbols = new_bsyms
+    new_trace.set_provenance(TraceProvenance("Remove context manager prims"))
+    return new_trace

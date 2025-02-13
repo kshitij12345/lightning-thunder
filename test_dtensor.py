@@ -13,16 +13,19 @@ mesh = DeviceMesh("cuda", list(range(num_devices)))
 
 hidden_size = 16
 
+
 def model(x, w):
     return torch.nn.functional.linear(x, w)
 
-weight = nn.Parameter(distribute_tensor(torch.randn(16, 16, requires_grad=True), mesh, [Shard(0)]))
-bias = nn.Parameter(distribute_tensor(torch.randn(16, requires_grad=True), mesh, [Shard(0)]))
 
-in_dtensor = distribute_tensor(torch.randn(4, 16, requires_grad=True), mesh, [Replicate()])
+weight = distribute_tensor(torch.randn(16, 16, requires_grad=False), mesh, [Shard(0)])
+bias = distribute_tensor(torch.randn(16, requires_grad=False), mesh, [Shard(0)])
+
+in_dtensor = distribute_tensor(torch.randn(4, 16, requires_grad=False), mesh, [Replicate()])
 
 expected = torch.compile(model)(in_dtensor, weight)
-actual = thunderfx(model, nv_enable_matmul=True, nv_enable_linear=True)(in_dtensor, weight)
+tmodel = thunderfx(model)
+actual = tmodel(in_dtensor, weight)
 
 # def model(x):
 #     return x + 1
@@ -41,3 +44,6 @@ torch.testing.assert_close(actual.to_local(), expected.to_local())
 # g_o = distribute_tensor(torch.ones(4, 16), mesh, [Shard(0)])
 # expected_g = torch.autograd.grad(expected, (in_dtensor, weight), g_o,)
 # actual_g = torch.autograd.grad(actual, (in_dtensor, weight), g_o)
+
+# if LOCAL_RANK == 0:
+#     tmodel.last_traces[-1].save_trace("dtensor_trc.py")
