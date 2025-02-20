@@ -36,7 +36,6 @@ from thunder.core.transform_common import (
     wrap_return_value_together_with_arguments,
     unwrap_return_value,
     remove_context_manager_prims_from_trace,
-    process_dtensor_and_register_bsyms,
 )
 from thunder.core.functionalization import (
     check_inplace_to_views,
@@ -551,9 +550,6 @@ def jit(
             computation_traces.append(computation_trc)
 
             computation_trc = remove_context_manager_prims_from_trace(computation_trc)
-            computation_traces.append(computation_trc)
-
-            computation_trc = process_dtensor_and_register_bsyms(computation_trc)
             computation_traces.append(computation_trc)
 
             orig_to_view_swap_map = check_inplace_to_views(computation_trc)

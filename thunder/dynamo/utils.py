@@ -16,7 +16,7 @@ from torch._subclasses.fake_tensor import FakeTensor
 if torch.distributed.is_available():
     from torch.distributed.tensor import DTensor
 else:
-    DTensor = NoneType  # 
+    DTensor = NoneType  #
 
 from thunder.torch.default_torch_ops import torch_auto_registered_ops
 from thunder.torch import _torch_to_thunder_function_map
@@ -251,6 +251,7 @@ def try_execute_thunder_symbol(thunder_symbol: Symbol, node: torch.fx.Node) -> t
         try:
             proxy_args, proxy_kwargs = get_proxy_inputs_from_node(node)
         except Exception as e:
+            raise e
             return False, SplitReason(
                 SplitReasonType.EXCEPTION_PROXY_THUNDER_OP,
                 f"Failed while creating proxy for node with name: {node.name} and target: {node.target}, see exception field",
@@ -262,6 +263,7 @@ def try_execute_thunder_symbol(thunder_symbol: Symbol, node: torch.fx.Node) -> t
             try:
                 thunder_symbol(*proxy_args, **proxy_kwargs)
             except Exception as e:
+                raise e
                 return False, SplitReason(
                     SplitReasonType.EXCEPTION_META_THUNDER_OP,
                     f"Failed while running meta for node with name: {node.name} and target: {node.target}, see exception field",
