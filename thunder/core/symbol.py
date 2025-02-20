@@ -285,6 +285,12 @@ class Symbol:
         return b
 
     def __call__(self, *args, **kwargs):
+        from thunder.distributed.prims import _prims_to_dtensor_prims
+
+        if self.is_prim and self in _prims_to_dtensor_prims:
+            dtensor_prim = _prims_to_dtensor_prims[self]
+            return dtensor_prim(*args, **kwargs)
+
         trace = get_tracectx()
 
         if trace is None:

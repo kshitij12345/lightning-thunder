@@ -8,8 +8,11 @@ import torch.distributed
 
 import thunder.core.utils as utils
 from thunder.core.prims import make_prim
+import thunder.core.prims as single_device_prims
+import thunder.core.devices as devices
+import thunder.core.dtypes as dtypes
 
-from thunder.core.proxies import DistParallelType, FutureTensorProxy, pytype, TensorProxy
+from thunder.core.proxies import DistParallelType, FutureTensorProxy, pytype, TensorProxy, DTensorProxy
 from thunder.core.transforms import register_augmented_forward, register_backward
 from thunder.distributed import get_skip_data_parallel_grad_sync
 
@@ -35,6 +38,9 @@ class PrimIDs(Enum):
 
     SYNCHRONIZE_TENSOR_PARALLEL_OUTPUT = auto()
     SYNCHRONIZE_TENSOR_PARALLEL_INPUT = auto()
+
+    # DTensor
+    DTENSOR_LINEAR = auto()
 
 
 # This enum describes what all_reduce (below) will actually do
@@ -552,3 +558,95 @@ def synchronize_tensor_parallel_input_backward_rule(
             return gathered_grad, None, None
         case _:
             utils.check(False, lambda: f"Invalid {layer_type=}")
+
+
+_prims_to_dtensor_prims = {}
+
+
+def register_dtensor_prim_mapping(orig_prim, dtensor_prim):
+    _prims_to_dtensor_prims[orig_prim] = dtensor_prim
+
+
+def linear_meta(a: DTensorProxy, w: DTensorProxy, bias: None | DTensorProxy) -> DTensorProxy:
+    # a's shape is (batch dims..., in)
+    # w's shape is (out x in)
+    # if bias is not None, bias's shape is (out)
+    # the output shape is (batch dims..., out)
+
+    # Checks types of the required arguments
+    utils.check(isinstance(a, DTensorProxy), lambda: f"a={a} was not a TensorProxy!")
+    utils.check(isinstance(w, DTensorProxy), lambda: f"w={w} was not a TensorProxy!")
+
+    # Checks that required arguments are on the same device
+    utils.check_same_device(a, w)
+
+    # Acquires the computation dtype and checks that a and w have the same dtype
+    dtype = a.dtype
+    utils.check(
+        dtypes.are_same_dtypes(a, w), lambda: f"Expected a.dtype={a.dtype} and w.dtype={w.dtype} to be the same!"
+    )
+
+    # Acquires the shape information and validates the shapes of the required arguments
+    batch_dims = a.shape[:-1]
+    in_length = a.shape[-1]
+
+    # Validates w's shape
+    utils.check(
+        len(w.shape) == 2, lambda: f"Expected w.shape={w.shape} to have length 2, but found length {len(w.shape)}!"
+    )
+    utils.check(
+        w.shape[1] == in_length,
+        lambda: f"Expected w.shape={w.shape} to have an innermost dimension of length {in_length}, the same length as the innermost dimension of a.shape={a.shape}!",
+    )
+
+    out_length = w.shape[0]
+
+    # Validates bias shape
+    if bias is not None:
+        utils.check(isinstance(bias, DTensorProxy), lambda: f"bias={bias} was not None or a TensorProxy!")
+        utils.check(
+            a.device == bias.device,
+            lambda: f"Expected a.device={a.device} and bias.device={bias.device} to be the same!",
+        )
+        utils.check(
+            len(bias.shape) == 1,
+            lambda: f"Expected bias.shape={bias.shape} to have length 1, but found length {len(bias.shape)}!",
+        )
+        utils.check(
+            bias.shape[0] == out_length,
+            lambda: f"Expected bias.shape={bias.shape} to have an innermost dimension of length {out_length}, the same length as the outermost dimension of w.shape={w.shape}!",
+        )
+        utils.check(
+            dtypes.are_same_dtypes(bias, a),
+            lambda: f"Expected a.dtype={a.dtype} and bias.dtype={bias.dtype} to be the same!",
+        )
+
+    out_shape = batch_dims + (out_length,)
+
+    requires_grad = any((a.requires_grad, w.requires_grad, False if bias is None else bias.requires_grad))
+    local_result = TensorProxy(shape=out_shape, device=a.device, dtype=dtype, requires_grad=requires_grad)
+    return DTensorProxy(
+        local_tensor_proxy=local_result,
+        spec=a._spec,
+        shape=out_shape,
+        device=a.device,
+        dtype=dtype,
+        requires_grad=requires_grad,
+    )
+
+
+# 1. We need dtensor prims if we want to the prim
+# to compute and propagate `placements`/`sharding`.
+# Or
+# 2. We will need to update thunder.core.prims
+# to do the same if they find DTensorProxy as input.
+# Choosing option 1 as we ideally want primitives to be very basic
+# and thunder.core.prims having knowledge of `placements`/`sharding` is not ideal.
+# Having a special purpose prims for the same seems better.
+dtensor_linear = make_prim(
+    PrimIDs.DTENSOR_LINEAR,
+    "dtensor.linear",
+    meta=linear_meta,
+)
+
+register_dtensor_prim_mapping(single_device_prims.linear, dtensor_linear)

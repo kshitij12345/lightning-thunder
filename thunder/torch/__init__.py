@@ -4977,6 +4977,27 @@ def linear(a: TensorLike, w: TensorLike, /, bias: None | TensorLike = None) -> T
     return prims.linear(a, w, bias)
 
 
+@torchsymbol(torch.nn.functional.linear, id="dtensor.torch.nn.functional.linear")
+def dtensor_linear(a: TensorLike, w: TensorLike, /, bias: None | TensorLike = None) -> TensorLike:
+    return prims.linear(a, w, bias)
+
+
+def register_function_for_dtensor(torch_fn, single_device_symbol, dtensor_symbol):
+    from thunder.core.proxies import DTensorProxy
+
+    def dispatch_to_impl(*args, **kwargs):
+        filter_tensor_proxies = list(filter(lambda t: isinstance(t, TensorProxy), tree_flatten((args, kwargs))))
+        if all(map(lambda t: isinstance(t, DTensorProxy), filter_tensor_proxies)):
+            return dtensor_symbol(*args, **kwargs)
+        else:
+            return single_device_symbol(*args, **kwargs)
+
+    register_function(torch_fn, dispatch_to_impl)
+
+
+register_function_for_dtensor(torch.nn.functional.linear, linear, dtensor_linear)
+
+
 @torchsymbol(torch.logsumexp, is_method=True)
 def logsumexp(a: TensorLike, /, dim: int | Sequence[int], keepdim: bool = False) -> TensorLike:
     input_max = amax(a, dim, keepdim=True)

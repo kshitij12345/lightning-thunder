@@ -41,6 +41,7 @@ from thunder.core.proxies import (
     ProxyTag,
     TensorProxy,
     Variable,
+    DTensorProxy,
     is_proxy_name_available,
     proxy,
     unvariableify,
@@ -262,6 +263,9 @@ class JitCtx:
             # TODO: other caching modes
             co: CACHE_OPTIONS = get_cache_option()
             if co is CACHE_OPTIONS.CONSTANT_VALUES:
+                if isinstance(p, DTensorProxy):
+                    # Add check for mesh and layout.
+                    self.add_constraint((prims.check_python_repr, p, uvalue._spec))
                 self.add_constraint((clang.check_tensor_shape_and_metadata, p))
             elif co is CACHE_OPTIONS.SYMBOLIC_VALUES:
                 # TODO: establish guarding logic to allow non-broadcast shape change
@@ -1801,6 +1805,15 @@ def unpack_inputs(ctx, prologue_trace, pro_to_comp_inps, pro_to_epi_inps, args, 
                 for s in a.shape:
                     if isinstance(s, Proxy):
                         unpack(s)
+
+            if prim == prims.check_python_repr:
+                # How does torch.compile guard for this?
+                a = args[0]
+                o = AnyProxy(None, prefix="dtensor_spec")
+                bsym = prims.unpack_attr.bind(a, "_spec", output=o)
+                prologue_trace.bound_symbols.append(bsym)
+                prims.check_python_repr(o, repr(args[1]))
+                continue
 
             prim(*args)
 
