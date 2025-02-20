@@ -39,8 +39,8 @@ def test_{graph_name}():
     model = DynamoModule()
     from thunder.dynamo.report import run_repro
 
-    executor={executor_str}
-    if executor == None:
+    executor = {executor_str}
+    if executor is None:
         compiled_model = model
     else:
         compiled_model = executor(model)
@@ -55,7 +55,7 @@ test_{graph_name}()
 '''
 
 
-benchmark_multi_exe_code_template = '''
+pytest_benchmark_multi_exe_code_template = '''
 """
 Environment information get from `torch.utils.collect_env.get_pretty_env_info()`:
 {torch_env}
@@ -105,11 +105,55 @@ def test_{graph_name}(benchmark, executor, compute_type):
 {inputs}
 
     model = DynamoModule()
-    if executor == None:
+    if executor is None:
         compiled_model = model
     elif executor == torch_inductor:
         compiled_model = executor(model, inputs)
     else:
         compiled_model = executor(model)
     {call_benchmark}
+'''
+
+
+bsym_torch_compile_repro_template = """
+{python_func}
+
+from thunder.executors.torch_compile import make_compiled as make_torch_compile_callable
+import thunder.examine
+
+inputs = {inputs}
+
+jfn = thunder.jit({func_name})
+jfn(*inputs)
+
+trc = thunder.last_traces(jfn)[-1]
+fusion_symbols = thunder.examine.get_fusion_symbols(trc)
+assert len(fusion_symbols) == 1
+bsym = fusion_symbols[0]
+
+# NOTE: The nvFusion function cannot be compiled directly using `torch.compile`.
+# It must first be processed by Thunder into BoundSymbols and compiled with `make_torch_compile_callable`.
+# Additionally, it's recommended to visually verify that `bsym` matches the
+# `nvFusion` function above by printing it using `print(bsym)`.
+torch_compiled_callable = make_torch_compile_callable(bsym.subsymbols, bsym.flat_args, bsym.flat_outs)
+"""
+
+repro_bench_code_template = '''
+"""
+Environment information get from `torch.utils.collect_env.get_pretty_env_info()`:
+{torch_env}
+
+Versions of Thunder related libraries:
+{thunder_pkgs}
+
+{extra_comment_str}
+"""
+{import_str}
+
+def test_{graph_name}():
+{dynamo_module}
+
+{inputs}
+
+    model = DynamoModule()
 '''
