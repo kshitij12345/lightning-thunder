@@ -2217,6 +2217,13 @@ if torch.distributed.is_available():
         checker=_always_executable,
     )
 
+    dtensor_linear_impl = ex.register_operator(
+        "torch_dtensor_linear_impl",
+        meta=dist_prims.dtensor_linear.meta,
+        fn=torch.nn.functional.linear,
+    )
+    _register_implementation(dist_prims.dtensor_linear, dtensor_linear_impl, checker=_always_executable)
+
 # Memory access operations
 item = _register_torch_operation("item", module=torch.Tensor)
 _register_implementation(prims.item, item, checker=_always_executable)
