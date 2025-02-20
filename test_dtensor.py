@@ -45,5 +45,5 @@ torch.testing.assert_close(actual.to_local(), expected.to_local())
 # expected_g = torch.autograd.grad(expected, (in_dtensor, weight), g_o,)
 # actual_g = torch.autograd.grad(actual, (in_dtensor, weight), g_o)
 
-# if LOCAL_RANK == 0:
-#     tmodel.last_traces[-1].save_trace("dtensor_trc.py")
+if LOCAL_RANK == 0:
+    tmodel.last_traces[-1].save_trace("dtensor_trc.py")

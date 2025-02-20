@@ -1875,12 +1875,15 @@ class TensorProxy(Proxy, TensorProxyInterface):
         return method(self)
 
 
+# Inherit from TensorProxy as DTensor also supports
+# Tensor methods like __add__, __div__, sin, etc.
 class DTensorProxy(TensorProxy):
     def __init__(
         self,
         name=None,
         *,
-        spec=None,
+        local_tensor_proxy,
+        spec,
         like=None,
         shape=None,
         device=None,
@@ -1908,6 +1911,7 @@ class DTensorProxy(TensorProxy):
             thunder_fsdp_padding_size=thunder_fsdp_padding_size,
         )
         self._spec = AnyProxy(spec, history=history)
+        self._local_tensor = local_tensor_proxy
 
     def type_string(self):
         return f"DTensor {self.device.device_str()} {self.dtype.shortname()}{list(self._shape)}"
@@ -1946,6 +1950,7 @@ class DTensorProxy(TensorProxy):
         tags = changes.get("tags", self.tags)
         return DTensorProxy(
             name=name,
+            local_tensor_proxy=self._local_tensor,
             spec=self._spec,
             tags=tags,
             shape=shape,
@@ -2121,13 +2126,14 @@ def proxy(x: Any, *, name: str | None = None, history: None | tuple = None) -> A
     if isinstance(x, DTensor):
         t = x._local_tensor
         shape = x.shape
-        device = devices.to_device(t.device)
-        dtype = dtypes.to_dtype(t.dtype)
+        device = devices.to_device(x.device)
+        dtype = dtypes.to_dtype(x.dtype)
         grad = None
         distparallel_type = None
         _thunder_fsdp_padding_size = None
         return DTensorProxy(
             name,
+            local_tensor_proxy=proxy(t),
             spec=x._spec,
             shape=tuple(shape),
             device=device,
