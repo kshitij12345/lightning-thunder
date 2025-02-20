@@ -229,71 +229,20 @@ _translation_map: dict[Hashable, Callable] = {}
 def get_translator(bsym: BoundSymbol) -> Callable:
     return _translation_map[bsym.sym.id]
 
-from collections.abc import Iterable
-from nvfuser import DataType, FusionDefinition
-from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Placement, Shard, Replicate
-from typing import Callable, cast
-import torch.distributed as dist
-
-class MultiDeviceFusionDefinition(FusionDefinition):
-    def _find_tensor_by_index(self, index: int) -> nvfuser.Tensor:
-        for t in self.sched.tensors():
-            if t.index == index:
-                return t
-        return None
-
-    def multidevice_schedule(self) -> None:
-        for in_tensor_index, in_dtensor in zip(self.inputs(), self.in_dtensors):
-            in_tensor = self._find_tensor_by_index(in_tensor_index)
-
-            # Set the device mesh.
-            assert (
-                in_dtensor.device_mesh.ndim == 1
-            ), "nvFuser's Python API only supports 1D meshes."
-            mesh = nvfuser.DeviceMesh(in_dtensor.device_mesh.mesh.tolist())
-
-            self.sched._set_device_mesh(in_tensor, mesh)
-
-            # Parallelize.
-            assert len(in_dtensor.placements) == 1, "Expect a 1D mesh"
-            placement: Placement = in_dtensor.placements[0]
-            if placement.is_shard():
-                dim = cast(Shard, placement).dim
-                self.sched.parallelize(
-                    in_tensor, dim, nvfuser.ParallelType.mesh_x
-                )
-    
-    def __call__(self, in_dtensors: Iterable[DTensor], **kwargs) -> list[DTensor]:
-        in_tensors = [in_dtensor.to_local() for in_dtensor in in_dtensors]
-        out_tensors = self.execute(in_tensors, **kwargs)
-
-        for i, out_tensor in enumerate(out_tensors):
-            if isinstance(out_tensor, nvfuser.DistributedTensor):
-                mesh = dist.device_mesh.init_device_mesh(
-                    "cuda", (out_tensor.mesh.size,)
-                )
-                placements: list[Placement] = []
-                for parallel_type in [nvfuser.ParallelType.mesh_x]:
-                    axis: int = out_tensor.axis_sharded_on(parallel_type)
-                    placements.append(Replicate() if axis == -1 else Shard(axis))
-                out_tensors[i] = DTensor.from_local(out_tensor.local, mesh, placements)
-        return out_tensors
-
 
 def create_fd(
     bsyms: list[BoundSymbol],
     input_descriptors: Sequence[type | tuple[tuple[int, ...], tuple[bool, ...], tuple[int, ...]]],
     sorted_unique_inputs: list[Proxy],
     sorted_unique_outputs: list[Proxy],
-) -> MultiDeviceFusionDefinition:
+) -> FusionDefinition:
     lc_to_nv_map = utils.ProxyDict()
 
     # NOTE nvFuser's default max length is 1024 operations at the time of this writing
     #   This arbitrarily increases it to 9999
     # TODO Review splititng very large fusions or removing the max length restriction completely
     #   See "Very large nvFuser fusions hit max_length"
-    fd = MultiDeviceFusionDefinition(max_length=9999)
+    fd = FusionDefinition(max_length=9999)
     with fd:
         # NOTE Adding constants is disabled for the moment in favor of definining them inline
         # 0) Adds constants
@@ -515,9 +464,6 @@ class FusionDefinitionWrapper:
 
     def __call__(self, *args):
         fd = self.get_fd(self.to_descriptors(args))
-
-        # MultiDeviceFusionDefinition uses it. Do it gracefully.
-        fd.in_dtensors = args
         self.last_used = fd
 
         if self.store_inputs:
@@ -539,7 +485,7 @@ class FusionDefinitionWrapper:
             )
 
         with annotate_for_profile(self.name):
-            return fd(args, **kwargs)
+            return fd.execute(args, **kwargs)
 
     def __repr__(self):
         return f"FusionDefinitionWrapper({self.name})"

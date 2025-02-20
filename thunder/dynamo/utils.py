@@ -251,7 +251,6 @@ def try_execute_thunder_symbol(thunder_symbol: Symbol, node: torch.fx.Node) -> t
         try:
             proxy_args, proxy_kwargs = get_proxy_inputs_from_node(node)
         except Exception as e:
-            raise e
             return False, SplitReason(
                 SplitReasonType.EXCEPTION_PROXY_THUNDER_OP,
                 f"Failed while creating proxy for node with name: {node.name} and target: {node.target}, see exception field",
@@ -263,7 +262,6 @@ def try_execute_thunder_symbol(thunder_symbol: Symbol, node: torch.fx.Node) -> t
             try:
                 thunder_symbol(*proxy_args, **proxy_kwargs)
             except Exception as e:
-                raise e
                 return False, SplitReason(
                     SplitReasonType.EXCEPTION_META_THUNDER_OP,
                     f"Failed while running meta for node with name: {node.name} and target: {node.target}, see exception field",
