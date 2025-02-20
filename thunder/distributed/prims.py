@@ -635,6 +635,14 @@ def linear_meta(a: DTensorProxy, w: DTensorProxy, bias: None | DTensorProxy) -> 
     )
 
 
+# 1. We need dtensor prims if we want to the prim
+# to compute and propagate `placements`/`sharding`.
+# Or
+# 2. We will need to update thunder.core.prims
+# to do the same if they find DTensorProxy as input.
+# Choosing option 1 as we ideally want primitives to be very basic
+# and thunder.core.prims having knowledge of `placements`/`sharding` is not ideal.
+# Having a special purpose prims for the same seems better.
 dtensor_linear = make_prim(
     PrimIDs.DTENSOR_LINEAR,
     "dtensor.linear",
