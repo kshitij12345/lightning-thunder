@@ -34,7 +34,7 @@ import thunder.core.prims as prims
 import thunder.core.utils as utils
 import thunder.distributed.prims as dist_prims
 from thunder.core.langctxs import langctx, Languages, get_langctx
-from thunder.core.compile_data import get_compile_data
+from thunder.core.compile_data import get_compile_data, get_compile_option
 from thunder.core.proxies import (
     FloatProxy,
     IntegerProxy,
@@ -215,6 +215,25 @@ class torchsymbol:
             ), -1
 
         return sym
+
+
+def register_function_for_scale_tensor(torch_fn, single_device_symbol, scale_tensor_symbol):
+    from thunder.core.proxies import ScaleTensorProxy
+
+    def dispatch_to_impl(*args, **kwargs):
+        # for arg in tree_flatten((args, kwargs))[0]:
+        #     breakpoint()
+
+        filter_tensor_proxies = list(filter(lambda t: isinstance(t, TensorProxy), tree_flatten((args, kwargs))[0]))
+        tensor_subclass = get_compile_option("_tensor_subclass", "Subclass")
+        if all(map(lambda t: isinstance(t, ScaleTensorProxy), filter_tensor_proxies)) and tensor_subclass is not None:
+            # TODO: Error on mixed torch.Tensor and DTensor
+            # https://github.com/pytorch/pytorch/blob/f522d899fb297453d0b821140bac38c1b4eef569/torch/distributed/tensor/_dispatch.py#L474-L477
+            return scale_tensor_symbol(*args, **kwargs)
+        else:
+            return single_device_symbol(*args, **kwargs)
+
+    register_function(torch_fn, dispatch_to_impl)
 
 
 # This is function maps an implementation for `torch` operation without creating a Symbol.
@@ -5469,6 +5488,26 @@ register_function(torch._C._functorch.unwrap_if_dead, _unwrap_if_dead)
 @torchsymbol(torch.ops.aten.mul.Tensor, id="aten.mul.Tensor")
 def aten_mul(x, y):
     return clang.mul(x, y)
+
+
+@torchsymbol(torch.mul, is_method=True, id="scale_tensor.torch.reshape")
+def scale_tensor_mul(a: TensorLike, b: TensorLike) -> TensorLike:
+    from thunder.torch.tensor_subclass_utils import decompose_into_aten_subsymbols
+    from thunder.core.trace import TraceCtx, get_tracectx
+
+    trc = get_tracectx()
+    trc.push_scope([])
+    o = mul(a, b)
+    _, out_spec = tree_flatten(o)
+    bsym = trc.pop_scope()[0]
+
+    tensor_subclass = get_compile_option("_tensor_subclass", "Subclass")
+    outs = decompose_into_aten_subsymbols(bsym, trc, tensor_subclass)
+
+    return tree_unflatten(outs, out_spec)
+
+
+register_function_for_scale_tensor(torch.mul, mul, scale_tensor_mul)
 
 
 @torchsymbol(torch.ops.aten.split.Tensor, id="aten.split.Tensor")

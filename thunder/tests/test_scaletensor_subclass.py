@@ -65,7 +65,7 @@ class ScaleTensor(torch.Tensor):
 
 # @torch.compile()
 def f(x, y):
-    return x * y  #  * 2
+    return torch.mul(x, y)  #  * 2
     # return x.split(2)
     # return torch.nn.functional.smooth_l1_loss(x, y)
 
@@ -86,21 +86,8 @@ from thunder.torch.tensor_subclass_utils import (
 )
 
 
-class ATenTransform(Transform):
+class PrintTrace(Transform):
     def transform_traces_pre_prologue(self, prologue_trace, comp_trace, epi_trc, executors_list):
-        from thunder.core.pytree import tree_map, tree_flatten, tree_unflatten
-        from thunder.core.proxies import TensorProxy, ScaleTensorProxy, variableify
-        from thunder.core.prims import unpack_trivial, python_return
-        import thunder.core.prims as prims
-        from thunder.executors.torch_compile import make_compiled as make_torch_compile_callable
-        from thunder.core.trace import tracectx
-
-        for bsym in comp_trace.bound_symbols:
-            if bsym.sym in (unpack_trivial, python_return):
-                continue
-
-            bsym = decompose_into_aten_subsymbols(bsym, comp_trace, ScaleTensor)
-
         print(comp_trace)
         return prologue_trace, comp_trace, epi_trc
 
@@ -108,8 +95,9 @@ class ATenTransform(Transform):
 jfn = thunderfx(
     f,
     transforms=[
-        ATenTransform(),
+        PrintTrace(),
     ],
+    _tensor_subclass=ScaleTensor,
 )
 o = jfn(x1, x2)
 

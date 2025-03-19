@@ -167,7 +167,7 @@ def get_fx_graph(trc, args_for_fx, tensor_subclass):
         flatten_tensor_proxy(arg) if isinstance(arg, ScaleTensorProxy) else arg for arg in args_for_fx
     )
 
-    trc = thunder.trace(rename_proxies=False)(wrap, flattened_args)
+    trc = thunder.trace(rename_proxies=False, inline_trace=False)(wrap, flattened_args)
 
     aten_syms = []
     for bsym in trc.bound_symbols:
@@ -194,18 +194,23 @@ def decompose_into_aten_subsymbols(bsym, comp_trace, tensor_subclass):
         executable_trc = make_trace_executable(trc, *bsym.flat_args)
         aten_bsyms, output = get_fx_graph(executable_trc, bsym.flat_args, tensor_subclass)
 
-        comp_trace.push_scope([])
         with tracectx(comp_trace):
             proxys = []
             for tp in filter_tensor_proxies:
                 proxys.append(prims.get_subclass_inner_tensor(tp))
-        syms = comp_trace.pop_scope()
 
-        return_bsyms = []
+            comp_trace.peek_scope().extend(aten_bsyms)
+            for bsym in aten_bsyms:
+                for arg in bsym.flat_proxy_args:
+                    if not comp_trace.has_name(arg.name):
+                        comp_trace.add_name(arg.name)
+                for out in bsym.flat_proxy_outs:
+                    if not comp_trace.has_name(out.name):
+                        comp_trace.add_name(out.name)
+
+        outs = []
         for o_proxy, o in zip(bsym.flat_outs, output):
-            cons_bsym = prims.construct_subclass.bind(*o, output=o_proxy)
-            return_bsyms.append(cons_bsym)
+            o = prims.construct_subclass(*o)
+            outs.append(o)
 
-        bsym.subsymbols = syms + aten_bsyms + return_bsyms
-
-    return bsym
+    return outs

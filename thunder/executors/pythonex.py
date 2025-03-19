@@ -389,10 +389,14 @@ def _get_subclass_inner_tensor(t):
 get_subclass_inner_tensor = ex.register_operator(
     "get_subclass_inner_tensor", like=prims.get_subclass_inner_tensor, fn=_get_subclass_inner_tensor
 )
+ex.register_implementation(prims.get_subclass_inner_tensor, get_subclass_inner_tensor)
 
 
 def _construct_subclass(t, a):
-    return ScaleTensor(t, a)
+    # This is totally wrong!
+    return t
+    # return ScaleTensor(t, a)
 
 
 construct_subclass = ex.register_operator("construct_subclass", like=prims.construct_subclass, fn=_construct_subclass)
+ex.register_implementation(prims.construct_subclass, construct_subclass)
