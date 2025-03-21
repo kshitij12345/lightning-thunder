@@ -34,7 +34,7 @@ import thunder.core.prims as prims
 import thunder.core.utils as utils
 import thunder.distributed.prims as dist_prims
 from thunder.core.langctxs import langctx, Languages, get_langctx
-from thunder.core.compile_data import get_compile_data
+from thunder.core.compile_data import get_compile_data, get_compile_option
 from thunder.core.proxies import (
     FloatProxy,
     IntegerProxy,
@@ -215,6 +215,25 @@ class torchsymbol:
             ), -1
 
         return sym
+
+
+def register_function_for_scale_tensor(torch_fn, single_device_symbol, scale_tensor_symbol):
+    from thunder.core.proxies import ScaleTensorProxy
+
+    def dispatch_to_impl(*args, **kwargs):
+        # for arg in tree_flatten((args, kwargs))[0]:
+        #     breakpoint()
+
+        filter_tensor_proxies = list(filter(lambda t: isinstance(t, TensorProxy), tree_flatten((args, kwargs))[0]))
+        tensor_subclass = get_compile_option("_tensor_subclass", "Subclass")
+        if all(map(lambda t: isinstance(t, ScaleTensorProxy), filter_tensor_proxies)) and tensor_subclass is not None:
+            # TODO: Error on mixed torch.Tensor and DTensor
+            # https://github.com/pytorch/pytorch/blob/f522d899fb297453d0b821140bac38c1b4eef569/torch/distributed/tensor/_dispatch.py#L474-L477
+            return scale_tensor_symbol(*args, **kwargs)
+        else:
+            return single_device_symbol(*args, **kwargs)
+
+    register_function(torch_fn, dispatch_to_impl)
 
 
 # This is function maps an implementation for `torch` operation without creating a Symbol.
@@ -5474,6 +5493,90 @@ def _unwrap_if_dead(tensor):
 
 
 register_function(torch._C._functorch.unwrap_if_dead, _unwrap_if_dead)
+
+
+@torchsymbol(torch.ops.aten.mul.Tensor, id="aten.mul.Tensor")
+def aten_mul(x, y):
+    return clang.mul(x, y)
+
+
+@torchsymbol(torch.mul, is_method=True, id="scale_tensor.torch.reshape")
+def scale_tensor_mul(a: TensorLike, b: TensorLike) -> TensorLike:
+    from thunder.torch.tensor_subclass_utils import decompose_into_aten_subsymbols
+    from thunder.core.trace import TraceCtx, get_tracectx
+
+    trc = get_tracectx()
+    trc.push_scope([])
+    o = mul(a, b)
+    _, out_spec = tree_flatten(o)
+    bsym = trc.pop_scope()[0]
+
+    tensor_subclass = get_compile_option("_tensor_subclass", "Subclass")
+    outs = decompose_into_aten_subsymbols(bsym, trc, tensor_subclass)
+
+    return tree_unflatten(outs, out_spec)
+
+
+register_function_for_scale_tensor(torch.mul, mul, scale_tensor_mul)
+
+
+@torchsymbol(torch.ops.aten.split.Tensor, id="aten.split.Tensor")
+def aten_split(a: TensorProxy, size_or_sections: int | Sequence[int], /, dim=0):
+    # TODO See note in tensor_split
+    if isinstance(size_or_sections, TensorProxy):
+        raise NotImplementedError
+
+    dim = utils.canonicalize_dim(a.ndim, dim)
+
+    utils.check_type(
+        size_or_sections,
+        (int, IntegerProxy, Sequence),
+    )
+
+    # TODO: consider revising this to just call _split_indices
+    if isinstance(size_or_sections, (int, IntegerProxy)):
+        target_length = size_or_sections
+
+        # Short-circuits special-case of zero
+        if target_length == 0:
+            utils.check(
+                a.shape[dim] == 0,
+                lambda: f"When size_or_sections={size_or_sections} is zero then the length of the split dimension ({a.shape[dim]}) must also be zero",
+            )
+            return full_like(a)
+
+        last_length = a.shape[dim] % target_length
+        num_splits = a.shape[dim] // target_length
+        cur_idx = 0
+        splits = []
+
+        for _ in range(num_splits):
+            splits.append(clang.slice_in_dim(a, cur_idx, cur_idx + target_length, dim=dim))
+            cur_idx = cur_idx + target_length
+
+        # Handles tail
+        if last_length > 0:
+            splits.append(clang.slice_in_dim(a, cur_idx, a.shape[dim], dim=dim))
+
+        return splits
+
+    # NOTE: isinstance(size_or_sections, Sequence)
+    # Converts lengths to indices
+
+    s = reduce(operator.add, size_or_sections, 0)
+    utils.check(
+        s == a.shape[dim],
+        lambda: f"size_or_sections={size_or_sections} must sum to the length of the split dimension ({len(a.shape[dim])})",
+    )
+
+    # NOTE: because split requires overspecifying the lengths, the final split is ignored
+    cur = 0
+    indices = []
+    for l in size_or_sections[: len(size_or_sections) - 1]:
+        cur += l
+        indices.append(cur)
+
+    return _split_indices(a, indices, dim)
 
 
 @torchsymbol(
