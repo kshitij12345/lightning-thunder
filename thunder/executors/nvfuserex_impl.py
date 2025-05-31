@@ -243,7 +243,7 @@ def get_translator(bsym: BoundSymbol) -> Callable:
     return _translation_map[bsym.sym.id]
 
 
-def get_methods_for_dtensor_fd():
+def get_methods_for_dtensor_fd(in_dtensors):
     def _find_tensor_by_index(self, index: int) -> nvfuser.Tensor:
         for t in self.sched.tensors():
             if t.index == index:
@@ -251,22 +251,22 @@ def get_methods_for_dtensor_fd():
         return None
 
     def multidevice_schedule(self) -> None:
-        for in_tensor_index, in_dtensor in zip(self.inputs(), self.in_dtensors):
+        for in_tensor_index, in_dtensor in zip(self.inputs(), in_dtensors):
             in_tensor = self._find_tensor_by_index(in_tensor_index)
 
             # Set the device mesh.
             assert (
-                in_dtensor.device_mesh.ndim == 1
+                in_dtensor.spec._o.device_mesh.ndim == 1
             ), "nvFuser's Python API only supports 1D meshes."
-            mesh = nvfuser.DeviceMesh(in_dtensor.device_mesh.mesh.tolist())
+            mesh = nvfuser.DeviceMesh(in_dtensor.spec._o.device_mesh.mesh.tolist())
 
             self.sched._set_device_mesh(in_tensor, mesh)
 
             # Split and parallelize.
-            assert len(in_dtensor.placements) == 1, "Expect a 1D mesh"
+            assert len(in_dtensor.spec._o.placements) == 1, "Expect a 1D mesh"
             # When the mesh is multi-dimensional, iterate through the
             # placements in descending order of Placement.dim.
-            placement: Placement = in_dtensor.placements[0]
+            placement: Placement = in_dtensor.spec._o.placements[0]
             if placement.is_shard():
                 dim = cast(Shard, placement).dim
                 self.sched.split(in_tensor, dim, mesh.size, False)
@@ -385,11 +385,10 @@ def create_fd(
         setattr(instance, as_name, bound_method)
         return bound_method
 
-    _find_tensor_by_index, multidevice_schedule = get_methods_for_dtensor_fd()
-    # fd._find_tensor_by_index = _find_tensor_by_index
-    # fd.multidevice_schedule = multidevice_schedule
+    _find_tensor_by_index, multidevice_schedule = get_methods_for_dtensor_fd(sorted_unique_inputs)
     bind(fd, multidevice_schedule, "multidevice_schedule")
     bind(fd, _find_tensor_by_index, "_find_tensor_by_index")
+
     return fd
 
 
@@ -529,7 +528,6 @@ class FusionDefinitionWrapper:
         if hasattr(fd, "_selected_device"):
             kwargs["device"] = fd._selected_device
 
-        fd.in_dtensors = args
         in_tensors = [in_dtensor.to_local() for in_dtensor in args]
         with annotate_for_profile(self.name):
             out_tensors, out_shardings = fd.execute(
