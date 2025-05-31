@@ -307,20 +307,6 @@ def create_fd(
                 nvdtype = lcdtype_to_nvdtype(x.python_type)
                 nv = fd.define_scalar(nvdtype)
                 lc_to_nv_map[x] = nv
-            # elif isinstance(x, DTensorProxy):
-            #     utils.check_type(y, tuple)
-            #     contiguity, stride_order = y
-            #     symbolic_shape = compute_symbolic_shape(x.local_tensor._shape, x.local_tensor._shape)
-            #     nvdtype = lcdtype_to_nvdtype(x.dtype)
-            #     is_cpu = x.device == cpu
-            #     nv = fd.define_tensor(
-            #         shape=symbolic_shape, contiguity=contiguity, dtype=nvdtype, stride_order=stride_order, is_cpu=is_cpu
-            #     )
-            #     lc_to_nv_map[x] = nv
-
-            #     for idx, s in enumerate(x.shape):
-            #         if isinstance(s, Proxy):
-            #             lc_to_nv_map[s] = nv.size(idx)
             elif isinstance(x, TensorProxy):
                 utils.check_type(y, tuple)
                 contiguity, stride_order = y
@@ -385,11 +371,14 @@ def create_fd(
         setattr(instance, as_name, bound_method)
         return bound_method
 
-    _find_tensor_by_index, multidevice_schedule = get_methods_for_dtensor_fd(sorted_unique_inputs)
-    bind(fd, multidevice_schedule, "multidevice_schedule")
-    bind(fd, _find_tensor_by_index, "_find_tensor_by_index")
+    is_dtensor_fd = False
+    if any(map(lambda t: isinstance(t, DTensorProxy), sorted_unique_inputs)):
+        _find_tensor_by_index, multidevice_schedule = get_methods_for_dtensor_fd(sorted_unique_inputs)
+        bind(fd, multidevice_schedule, "multidevice_schedule")
+        bind(fd, _find_tensor_by_index, "_find_tensor_by_index")
+        is_dtensor_fd = True
 
-    return fd
+    return fd, is_dtensor_fd
 
 
 def compute_symbolic_shape(
@@ -511,11 +500,12 @@ class FusionDefinitionWrapper:
     save_fake_inputs: bool = False
     enable_options: None | list[str] = None
     disable_options: None | list[str] = None
+    is_dtensor_fd: None | bool = None
 
     @annotate_for_profile("FusionDefinitionWrapper.__call__")
     def __call__(self, *args):
         if self.use_cache or self.last_used is None:
-            self.last_used = self.get_fd(self.to_descriptors(args))
+            self.last_used, self.is_dtensor_fd = self.get_fd(self.to_descriptors(args))
         fd = self.last_used
 
         if self.store_inputs:
@@ -528,23 +518,28 @@ class FusionDefinitionWrapper:
         if hasattr(fd, "_selected_device"):
             kwargs["device"] = fd._selected_device
 
-        in_tensors = [in_dtensor.to_local() for in_dtensor in args]
-        with annotate_for_profile(self.name):
-            out_tensors, out_shardings = fd.execute(
-                in_tensors, _enable_options=self.enable_options, _disable_options=self.disable_options, **kwargs
+        if self.is_dtensor_fd:
+            in_tensors = [in_dtensor.to_local() for in_dtensor in args]
+            with annotate_for_profile(self.name):
+                out_tensors, out_shardings = fd.execute(
+                    in_tensors, _enable_options=self.enable_options, _disable_options=self.disable_options, **kwargs
+                )
+
+                assert len(out_tensors) == len(out_shardings)
+                out_dtensors: list[DTensor] = []
+                for out_tensor, out_sharding in zip(out_tensors, out_shardings):
+                    mesh = dist.device_mesh.init_device_mesh("cuda", (out_sharding.mesh.size,))
+                    placements: list[Placement] = []
+                    for parallel_type in [nvfuser.ParallelType.mesh_x]:
+                        axis: int = out_sharding.axis_sharded_on(parallel_type)
+                        placements.append(Replicate() if axis == -1 else Shard(axis))
+                    out_dtensors.append(DTensor.from_local(out_tensor, mesh, placements))
+
+                return out_dtensors
+        else:
+            return fd.execute(
+                args, _enable_options=self.enable_options, _disable_options=self.disable_options, **kwargs
             )
-
-            assert len(out_tensors) == len(out_shardings)
-            out_dtensors: list[DTensor] = []
-            for out_tensor, out_sharding in zip(out_tensors, out_shardings):
-                mesh = dist.device_mesh.init_device_mesh("cuda", (out_sharding.mesh.size,))
-                placements: list[Placement] = []
-                for parallel_type in [nvfuser.ParallelType.mesh_x]:
-                    axis: int = out_sharding.axis_sharded_on(parallel_type)
-                    placements.append(Replicate() if axis == -1 else Shard(axis))
-                out_dtensors.append(DTensor.from_local(out_tensor, mesh, placements))
-
-            return out_dtensors
 
     def __repr__(self):
         return f"FusionDefinitionWrapper({self.name})"
@@ -655,7 +650,7 @@ def create_fusion_definition_wrapper(
     # TODO (mruberry) We should think how to express "static fusion" that don't need to use
     #   a cache to improve dispatch performance
     @lru_cache(maxsize=2048)
-    def get_fd(input_descriptors) -> FusionDefinition:
+    def get_fd(input_descriptors) -> tuple[FusionDefinition, bool]:
         # A closure over local trace and region
         return create_fd(bsyms, input_descriptors, sorted_unique_inputs, sorted_unique_outputs)
 
