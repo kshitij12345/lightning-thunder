@@ -373,6 +373,8 @@ def create_fd(
 
     is_dtensor_fd = False
     if any(map(lambda t: isinstance(t, DTensorProxy), sorted_unique_inputs)):
+        assert all(map(lambda t: isinstance(t, DTensorProxy), sorted_unique_inputs)), \
+            "Currently we only support Fusion region with all DTensor inputs or all Tensor inputs but not a mix"
         _find_tensor_by_index, multidevice_schedule = get_methods_for_dtensor_fd(sorted_unique_inputs)
         bind(fd, multidevice_schedule, "multidevice_schedule")
         bind(fd, _find_tensor_by_index, "_find_tensor_by_index")
@@ -519,6 +521,7 @@ class FusionDefinitionWrapper:
             kwargs["device"] = fd._selected_device
 
         if self.is_dtensor_fd:
+            # TODO: Assert the placements (metadata) for in_dtensor is same as the one used during tracing.
             in_tensors = [in_dtensor.to_local() for in_dtensor in args]
             with annotate_for_profile(self.name):
                 out_tensors, out_shardings = fd.execute(
