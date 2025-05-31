@@ -9,10 +9,14 @@ import time
 from copy import copy
 from itertools import chain, filterfalse
 import warnings
+from typing import Callable, cast, TypeAlias
 
 from looseversion import LooseVersion
 import torch
 from torch import Tensor
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Placement, Shard, Replicate
+import torch.distributed as dist
 
 import thunder.core.dtypes as dtypes
 import thunder.torch as ltorch
@@ -42,6 +46,8 @@ from thunder.core.codeutils import Printable
 from thunder.core.transform_common import dce, cse_single_bsym, replace_redundant_inputs, NON_FUNCTIONAL_OPS
 from thunder.core.profile import annotate_for_profile
 from thunder.core.compile_data import get_compile_option
+from thunder.torch.experimental.dtensor_torch_and_prims import dtensor_mul_prim
+from thunder.torch.experimental.dtensor_proxy import DTensorProxy
 
 from thunder.core.transforms import (
     get_grad,
@@ -237,6 +243,40 @@ def get_translator(bsym: BoundSymbol) -> Callable:
     return _translation_map[bsym.sym.id]
 
 
+def get_methods_for_dtensor_fd():
+    def _find_tensor_by_index(self, index: int) -> nvfuser.Tensor:
+        for t in self.sched.tensors():
+            if t.index == index:
+                return t
+        return None
+
+    def multidevice_schedule(self) -> None:
+        for in_tensor_index, in_dtensor in zip(self.inputs(), self.in_dtensors):
+            in_tensor = self._find_tensor_by_index(in_tensor_index)
+
+            # Set the device mesh.
+            assert (
+                in_dtensor.device_mesh.ndim == 1
+            ), "nvFuser's Python API only supports 1D meshes."
+            mesh = nvfuser.DeviceMesh(in_dtensor.device_mesh.mesh.tolist())
+
+            self.sched._set_device_mesh(in_tensor, mesh)
+
+            # Split and parallelize.
+            assert len(in_dtensor.placements) == 1, "Expect a 1D mesh"
+            # When the mesh is multi-dimensional, iterate through the
+            # placements in descending order of Placement.dim.
+            placement: Placement = in_dtensor.placements[0]
+            if placement.is_shard():
+                dim = cast(Shard, placement).dim
+                self.sched.split(in_tensor, dim, mesh.size, False)
+                self.sched.parallelize(
+                    in_tensor, dim, nvfuser.ParallelType.mesh_x
+                )
+                self.sched.set_allocation_as_loop(in_tensor)
+    
+    return _find_tensor_by_index, multidevice_schedule
+
 def create_fd(
     bsyms: list[BoundSymbol],
     input_descriptors: Sequence[type | tuple[tuple[int, ...], tuple[bool, ...], tuple[int, ...]]],
@@ -267,6 +307,20 @@ def create_fd(
                 nvdtype = lcdtype_to_nvdtype(x.python_type)
                 nv = fd.define_scalar(nvdtype)
                 lc_to_nv_map[x] = nv
+            # elif isinstance(x, DTensorProxy):
+            #     utils.check_type(y, tuple)
+            #     contiguity, stride_order = y
+            #     symbolic_shape = compute_symbolic_shape(x.local_tensor._shape, x.local_tensor._shape)
+            #     nvdtype = lcdtype_to_nvdtype(x.dtype)
+            #     is_cpu = x.device == cpu
+            #     nv = fd.define_tensor(
+            #         shape=symbolic_shape, contiguity=contiguity, dtype=nvdtype, stride_order=stride_order, is_cpu=is_cpu
+            #     )
+            #     lc_to_nv_map[x] = nv
+
+            #     for idx, s in enumerate(x.shape):
+            #         if isinstance(s, Proxy):
+            #             lc_to_nv_map[s] = nv.size(idx)
             elif isinstance(x, TensorProxy):
                 utils.check_type(y, tuple)
                 contiguity, stride_order = y
@@ -319,6 +373,23 @@ def create_fd(
             nvout = lc_to_nv_map[out]
             fd.add_output(nvout)
 
+    def bind(instance, func, as_name=None):
+        """
+        Bind the function *func* to *instance*, with either provided name *as_name*
+        or the existing name of *func*. The provided *func* should accept the 
+        instance as the first argument, i.e. "self".
+        """
+        if as_name is None:
+            as_name = func.__name__
+        bound_method = func.__get__(instance, instance.__class__)
+        setattr(instance, as_name, bound_method)
+        return bound_method
+
+    _find_tensor_by_index, multidevice_schedule = get_methods_for_dtensor_fd()
+    # fd._find_tensor_by_index = _find_tensor_by_index
+    # fd.multidevice_schedule = multidevice_schedule
+    bind(fd, multidevice_schedule, "multidevice_schedule")
+    bind(fd, _find_tensor_by_index, "_find_tensor_by_index")
     return fd
 
 
@@ -458,10 +529,24 @@ class FusionDefinitionWrapper:
         if hasattr(fd, "_selected_device"):
             kwargs["device"] = fd._selected_device
 
+        fd.in_dtensors = args
+        in_tensors = [in_dtensor.to_local() for in_dtensor in args]
         with annotate_for_profile(self.name):
-            return fd.execute(
-                args, _enable_options=self.enable_options, _disable_options=self.disable_options, **kwargs
+            out_tensors, out_shardings = fd.execute(
+                in_tensors, _enable_options=self.enable_options, _disable_options=self.disable_options, **kwargs
             )
+
+            assert len(out_tensors) == len(out_shardings)
+            out_dtensors: list[DTensor] = []
+            for out_tensor, out_sharding in zip(out_tensors, out_shardings):
+                mesh = dist.device_mesh.init_device_mesh("cuda", (out_sharding.mesh.size,))
+                placements: list[Placement] = []
+                for parallel_type in [nvfuser.ParallelType.mesh_x]:
+                    axis: int = out_sharding.axis_sharded_on(parallel_type)
+                    placements.append(Replicate() if axis == -1 else Shard(axis))
+                out_dtensors.append(DTensor.from_local(out_tensor, mesh, placements))
+
+            return out_dtensors
 
     def __repr__(self):
         return f"FusionDefinitionWrapper({self.name})"
@@ -1898,6 +1983,7 @@ def mul(a: TensorProxy | Number, b: TensorProxy | Number, *, fd: FusionDefinitio
 
 
 register_supported(PrimIDs.MUL, mul, _elementwise_binary_check)
+register_supported(dtensor_mul_prim.id, mul, _elementwise_binary_check)
 
 
 def ne(a: TensorProxy | Number, b: TensorProxy | Number, *, fd: FusionDefinition, lc_to_nv_map: dict) -> Any:
