@@ -277,6 +277,20 @@ def get_methods_for_dtensor_fd(in_dtensors):
     
     return _find_tensor_by_index, multidevice_schedule
 
+
+def bind(instance, func, as_name=None):
+    """
+    Bind the function *func* to *instance*, with either provided name *as_name*
+    or the existing name of *func*. The provided *func* should accept the
+    instance as the first argument, i.e. "self".
+    """
+    if as_name is None:
+        as_name = func.__name__
+    bound_method = func.__get__(instance, instance.__class__)
+    setattr(instance, as_name, bound_method)
+    return bound_method
+
+
 def create_fd(
     bsyms: list[BoundSymbol],
     input_descriptors: Sequence[type | tuple[tuple[int, ...], tuple[bool, ...], tuple[int, ...]]],
@@ -290,7 +304,8 @@ def create_fd(
     # TODO Review splititng very large fusions or removing the max length restriction completely
     #   See "Very large nvFuser fusions hit max_length"
     fd = FusionDefinition(max_length=9999)
-    with fd:
+
+    def definition(fd):
         # NOTE Adding constants is disabled for the moment in favor of definining them inline
         # 0) Adds constants
 
@@ -359,26 +374,21 @@ def create_fd(
             nvout = lc_to_nv_map[out]
             fd.add_output(nvout)
 
-    def bind(instance, func, as_name=None):
-        """
-        Bind the function *func* to *instance*, with either provided name *as_name*
-        or the existing name of *func*. The provided *func* should accept the 
-        instance as the first argument, i.e. "self".
-        """
-        if as_name is None:
-            as_name = func.__name__
-        bound_method = func.__get__(instance, instance.__class__)
-        setattr(instance, as_name, bound_method)
-        return bound_method
 
     is_dtensor_fd = False
     if any(map(lambda t: isinstance(t, DTensorProxy), sorted_unique_inputs)):
+        # multi-GPU path
         assert all(map(lambda t: isinstance(t, DTensorProxy), sorted_unique_inputs)), \
             "Currently we only support Fusion region with all DTensor inputs or all Tensor inputs but not a mix"
         _find_tensor_by_index, multidevice_schedule = get_methods_for_dtensor_fd(sorted_unique_inputs)
+        bind(fd, definition, "definition")
         bind(fd, multidevice_schedule, "multidevice_schedule")
         bind(fd, _find_tensor_by_index, "_find_tensor_by_index")
         is_dtensor_fd = True
+    else:
+        # single device path
+        with fd:
+            definition(fd)
 
     return fd, is_dtensor_fd
 
