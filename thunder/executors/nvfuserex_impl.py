@@ -374,23 +374,20 @@ def create_fd(
             nvout = lc_to_nv_map[out]
             fd.add_output(nvout)
 
+    bind(fd, definition, "definition")
 
-    is_dtensor_fd = False
+    is_multigpu_fd = False
     if any(map(lambda t: isinstance(t, DTensorProxy), sorted_unique_inputs)):
         # multi-GPU path
         assert all(map(lambda t: isinstance(t, DTensorProxy), sorted_unique_inputs)), \
             "Currently we only support Fusion region with all DTensor inputs or all Tensor inputs but not a mix"
         _find_tensor_by_index, multidevice_schedule = get_methods_for_dtensor_fd(sorted_unique_inputs)
-        bind(fd, definition, "definition")
+
         bind(fd, multidevice_schedule, "multidevice_schedule")
         bind(fd, _find_tensor_by_index, "_find_tensor_by_index")
-        is_dtensor_fd = True
-    else:
-        # single device path
-        with fd:
-            definition(fd)
+        is_multigpu_fd = True
 
-    return fd, is_dtensor_fd
+    return fd, is_multigpu_fd
 
 
 def compute_symbolic_shape(
@@ -517,7 +514,7 @@ class FusionDefinitionWrapper:
     @annotate_for_profile("FusionDefinitionWrapper.__call__")
     def __call__(self, *args):
         if self.use_cache or self.last_used is None:
-            self.last_used, self.is_dtensor_fd = self.get_fd(self.to_descriptors(args))
+            self.last_used, self.is_multigpu_fd = self.get_fd(self.to_descriptors(args))
         fd = self.last_used
 
         if self.store_inputs:
@@ -530,7 +527,7 @@ class FusionDefinitionWrapper:
         if hasattr(fd, "_selected_device"):
             kwargs["device"] = fd._selected_device
 
-        if self.is_dtensor_fd:
+        if self.is_multigpu_fd:
             # TODO: Assert the placements (metadata) for in_dtensor is same as the one used during tracing.
             in_tensors = [in_dtensor.to_local() for in_dtensor in args]
             with annotate_for_profile(self.name):
