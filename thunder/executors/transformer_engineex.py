@@ -25,7 +25,7 @@ from thunder.extend import OperatorExecutor, register_executor
 from thunder.core.compile_data import get_compile_option, get_compile_data
 from thunder.distributed import FSDPType
 from thunder.executors.utils import Context, set_saved_tensors
-from thunder.core.trace import from_trace, TraceCtx, TraceProvenance
+from thunder.core.trace import from_trace, TraceCtx, TraceProvenance, tracectx
 
 
 __all__ = [
@@ -162,9 +162,10 @@ def _should_shard_intermediate() -> bool:
     return False
 
 
-def _get_num_saved_tensors(fp8_recipe):
+def _get_num_saved_tensors(fp8_recipe, w_requires_grad):
     MIN_DIM = MXFP8_BLOCK_SCALING_SIZE
     te_linear = te.Linear(MIN_DIM, MIN_DIM)
+    te_linear.weight.requires_grad_(w_requires_grad)
 
     x = torch.randn(MIN_DIM, MIN_DIM, device="cuda")
     with te.fp8_autocast(fp8_recipe=fp8_recipe):
@@ -324,7 +325,7 @@ transformer_engine_ex = OperatorExecutor("transformer_engine")
 register_executor(transformer_engine_ex)
 
 
-def make_te_linear_meta(is_grad_enabled: bool = False):
+def make_te_linear_meta(is_grad_enabled: bool = False, weight_requires_grad: bool = True):
     def _te_functional_linear_meta(
         a: TensorProxy, w: TensorProxy, bias: None | TensorProxy, weight_requires_grad: bool, bias_requires_grad: bool
     ) -> tuple[TensorProxy, AnyProxy | None]:
@@ -342,7 +343,7 @@ def make_te_linear_meta(is_grad_enabled: bool = False):
             # saved_tensors since they are not used in Thunder's meta functions.
             saved_tensors = tuple(
                 TensorProxy(like=a, shape=a.shape)
-                for _ in range(_get_num_saved_tensors(get_recipe_from_options_or_default_recipe()))
+                for _ in range(_get_num_saved_tensors(get_recipe_from_options_or_default_recipe(), weight_requires_grad))
             )
 
             return TensorProxy(like=a, shape=output_shape), saved_tensors, ctx_dict
@@ -412,9 +413,8 @@ def get_recipe_from_options_or_default_recipe():
     return fp8_recipe
 
 
-# Creates a new stateful operator for each invocation of `linear`.
 def _create_fp8_linear_bound_symbol(
-    a: TensorProxy, w: TensorProxy, b: TensorProxy, is_grad_enabled=False
+    a: TensorProxy, w: TensorProxy, b: TensorProxy, is_grad_enabled=False, weight_requires_grad=True
 ) -> tuple[torch.Tensor, AnyProxy | None]:
     linear_fn = partial(
         TELinear(w.shape[1], w.shape[0]),
@@ -432,7 +432,8 @@ def _create_fp8_linear_bound_symbol(
         bsym._import_ctx: dict[str, Any] = {IMPORT_CTX_TE_KEY: te}
         bsym._object_ctx: dict[str, Any] = {FP8_RECIPE_KEY: fp8_recipe}
 
-    meta_fn = make_te_linear_meta(is_grad_enabled=is_grad_enabled)
+    print(is_grad_enabled, weight_requires_grad)
+    meta_fn = make_te_linear_meta(is_grad_enabled=is_grad_enabled, weight_requires_grad=weight_requires_grad)
     sym = Symbol(
         name=name,
         meta=meta_fn,
@@ -441,12 +442,21 @@ def _create_fp8_linear_bound_symbol(
         _bind_postprocess=bind_postprocess,
         tags=(prims.OpTags.DONT_RECOMPUTE_IN_BACKWARD,),
     )
+    LINEAR_CALLS_COUNTER += 1
+    return sym, meta_fn
+
+
+# Creates a new stateful operator for each invocation of `linear`.
+def _insert_fp8_linear_bound_symbol_in_current_trace(
+    a: TensorProxy, w: TensorProxy, b: TensorProxy, is_grad_enabled=False, weight_requires_grad=True
+) -> tuple[torch.Tensor, AnyProxy | None]:
+    sym, meta_fn = _create_fp8_linear_bound_symbol(a, w, b, is_grad_enabled, weight_requires_grad)
 
     # Value for `weight_requires_grad` and `bias_requires_grad` are default.
     # The correct values are set by looking at the backward trace.
     # See NOTE: Implementation of _transformer_engine_set_requires_grad
     bsym = sym.bind(
-        a, w, b, True, True if b is not None else False, output=meta_fn(a, w, b, True, True if b is not None else False)
+        a, w, b, weight_requires_grad, True if b is not None else False, output=meta_fn(a, w, b, weight_requires_grad, True if b is not None else False)
     )
 
     # Now we need to append the BoundSymbol to the current trace.
@@ -454,8 +464,6 @@ def _create_fp8_linear_bound_symbol(
     trace.scopes[-1].append(bsym)
     for p in chain(bsym.flat_proxy_outs, bsym.flat_proxy_args):
         trace.names.add(p.name)
-
-    LINEAR_CALLS_COUNTER += 1
 
     # Used in augmented forward rule.
     # Returns are `result, saved_tensors, ctx`.
@@ -510,7 +518,7 @@ def _linear_checker(
 
 
 def linear_forward_rule(a, w, bias):
-    out, saved_tensors, ctx = _create_fp8_linear_bound_symbol(a, w, bias, is_grad_enabled=True)
+    out, saved_tensors, ctx = _insert_fp8_linear_bound_symbol_in_current_trace(a, w, bias, is_grad_enabled=True)
     primal = out
     saved_for_backward = (
         a.shape,
@@ -526,7 +534,7 @@ def linear_forward_rule(a, w, bias):
 
 # Translate calls from torch.nn.functional.linear to te.Linear (when the checker above returns True)
 def _linear_transform(a: TensorProxy, w: TensorProxy, b: TensorProxy) -> torch.Tensor:
-    return _create_fp8_linear_bound_symbol(a, w, b, is_grad_enabled=False)
+    return _insert_fp8_linear_bound_symbol_in_current_trace(a, w, b, is_grad_enabled=False)
 
 
 @disable_caching_split_forward_and_backward
@@ -608,15 +616,56 @@ def _transformer_engine_set_requires_grad(fw_extrace: TraceCtx, bw_extrace: Trac
             bsym.args = tuple(args)
         updated_bw_extrace.bound_symbols.append(bsym)
 
+    tensors_to_remove = []
+    ctx_to_new_saved_tensor_len = {}
     for bsym in fw_extrace.bound_symbols:
         if "te_linear" in bsym.sym.name:
             # Update the BoundSymbol to correctly pass the requires_grad flags to the `TELinear` module.
             w_requires_grad, b_requires_grad = ctx_to_requires_grad[bsym.output[-1].name]
             args = list(bsym.args)
+            org_w_requires_grad = args[-2]
+            org_b_requires_grad = args[-1]
             args[-2] = w_requires_grad
             args[-1] = b_requires_grad
+            args = tuple(args)
             bsym.args = tuple(args)
+
+            if org_w_requires_grad != w_requires_grad:
+                with tracectx(updated_fw_extrace):
+                    new_args = (args[:3]+(True, args[-2]))
+                    _, meta_fn = _create_fp8_linear_bound_symbol(*new_args)
+                    a, w, b = args[:3]
+                    output = meta_fn(a, w, b, w_requires_grad, b_requires_grad)
+                    o, saved_tensors, ctx = bsym.output
+                    _, new_saved_tensors, _ = output
+                    bsym.output = (o, saved_tensors[:len(new_saved_tensors)], ctx)
+                    ctx_to_new_saved_tensor_len[ctx.name] = len(new_saved_tensors)
+                    for t in saved_tensors[len(new_saved_tensors):]:
+                        tensors_to_remove.append(t.name)
+
         updated_fw_extrace.bound_symbols.append(bsym)
+
+    from thunder.core.vjp_utils import get_saved_for_backward_tensors, set_saved_for_backward_tensors
+
+    saved_tensors = get_saved_for_backward_tensors(updated_fw_extrace)
+    new_saved_tensors = []
+    for tensor in saved_tensors:
+        if tensor.name in tensors_to_remove:
+            continue
+        else:
+            new_saved_tensors.append(tensor)
+
+    set_saved_for_backward_tensors(updated_fw_extrace, new_saved_tensors)
+
+    updated_bw_extrace.bound_symbols[4].args = (updated_bw_extrace.bound_symbols[4].args[0], len(new_saved_tensors))
+    updated_bw_extrace.bound_symbols[4].output = new_saved_tensors
+
+    for bsym in updated_bw_extrace.bound_symbols:
+        if "te_functional_linear" in bsym.sym.name and bsym.args[5].name in ctx_to_new_saved_tensor_len:
+            new_saved_tensor_len = ctx_to_new_saved_tensor_len[bsym.args[5].name]
+            args = list(bsym.args)
+            args[6] = args[6][:new_saved_tensor_len]
+            bsym.args = tuple(args)
 
     updated_fw_extrace.set_provenance(TraceProvenance(f"TransformerEngine update weight and bias requires_grad pass"))
     updated_bw_extrace.set_provenance(TraceProvenance(f"TransformerEngine update weight and bias requires_grad pass"))
