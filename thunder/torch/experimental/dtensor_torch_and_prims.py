@@ -15,6 +15,7 @@ from thunder.core.transforms import (
     register_grad,
     put_grads,
     get_grad,
+    put_grad
 )
 from thunder.executors.torchex import ex as pytorchex
 from thunder.executors.pythonex import ex as pythonex
@@ -136,5 +137,55 @@ def dtensor_mul(a: TensorLike, b: TensorLike) -> TensorLike:
     return dtensor_mul_prim(a, b)
 
 
+def dtensor_linear_meta(a, w, bias):
+    output = run_with_fake_tensor(torch.nn.functional.linear, a, w, bias)
+    local_tensor_proxy = TensorProxy(like=a.local_tensor)
+    spec = output._spec
+    spec_proxy = AnyProxy(spec, history=a.history)
+    return create_dtensor_proxy_from_proxies(local_tensor_proxy, spec_proxy, False)
+
+
+dtensor_linear_prim = make_prim("dtensor_linear_prim", "dtensor_linear_prim", meta=dtensor_linear_meta)
+
+dtensor_linear_prim_impl = pytorchex.register_operator("dtensor_linear_prim", like=dtensor_linear_prim, fn=torch.nn.functional.linear)
+
+pytorchex.register_implementation(dtensor_linear_prim, dtensor_linear_prim_impl)
+
+
+# def _dtensor_linear_prim_grad(a: TensorLike, w: TensorLike, bias: None | TensorLike) -> TensorLike:
+#     fwd = dtensor_linear_prim(a, w, bias)
+
+#     g = get_grad(fwd)
+
+#     first_dim = -2
+#     grad_a = ltorch.matmul(g.reshape(-1, g.shape[-1]), w).reshape(a.shape)
+
+#     grad_w: TensorLike
+#     if a.ndim == 1:
+#         grad_w = ltorch.matmul(g.unsqueeze(first_dim).mT, a.unsqueeze(first_dim))
+#     else:
+#         grad_w = ltorch.matmul(g.reshape(-1, g.shape[-1]).mT, a.reshape(-1, a.shape[-1]))
+
+#     put_grads((a, w), (grad_a, grad_w))
+
+#     if bias is not None:
+#         if g.ndim > 1:
+#             grad_bias = ltorch.sum(g, tuple(range(g.ndim - 1)))
+#         else:
+#             grad_bias = g
+#         put_grad(bias, grad_bias)
+
+#     return fwd
+
+
+# register_grad(dtensor_linear_prim, _dtensor_linear_prim_grad)
+
+
+@dtensor_torchsymbol(torch.nn.functional.linear, id="dtensor.torch.nn.functional.linear")
+def dtensor_linear(a: TensorLike, w: TensorLike, bias: None | TensorLike = None) -> TensorLike:
+    return dtensor_linear_prim(a, w, bias)
+
+
 def register_dtensor_torch_and_prims():
     register_function_for_dtensor(torch.mul, ltorch.mul, dtensor_mul, is_method=True)
+    register_function_for_dtensor(torch.nn.functional.linear, ltorch.linear, dtensor_linear, is_method=False)
