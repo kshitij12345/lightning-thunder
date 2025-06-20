@@ -38,15 +38,6 @@ class Model(nn.Module):
 
 tmp_executor = TemporaryExecutor()
 
-
-# def my_from_local(x, mesh, placements, *, run_check: bool = False, shape: Optional[torch.Size] = None, stride: Optional[tuple[int, ...]] = None):
-#     res = dtensor_from_local_symbol(x, mesh, placements, run_check=run_check, shape=shape, stride=stride)
-#     pr = ProvenanceRecord(inst=PseudoInst.OPAQUE, inputs=[])
-#     dist_spec = res.spec
-#     wrap(dist_spec, provenance=pr).register_proxy(dist_spec)
-#     res = wrap(res, provenance=pr)
-#     return res
-
 tmp_executor._lookasides[DTensor.from_local] = dtensor_from_local_prim
 
 with torch.device(f"cuda:{LOCAL_RANK}"):
@@ -58,21 +49,6 @@ with torch.device(f"cuda:{LOCAL_RANK}"):
 
     model.fc1.weight.requires_grad = False
     model.fc2.weight.requires_grad = False
-
-    # def parallel_model(x):
-    #     return DTensor.from_local(x, mesh, [Shard(1)])
-
-    # def parallel_model(x):
-    #     return x.redistribute(mesh, [Shard(1)])
-
-    # def parallel_model(x):
-    #     return x.to_local()
-
-    # i = distribute_tensor(torch.randn(hidden_size, hidden_size), mesh, [Shard(0)])
-
-    # i = distribute_tensor(torch.randn(hidden_size, hidden_size), mesh, [Shard(0)])
-    # o = model(i)
-    # a = thunder.jit(model)(i)
 
     i = torch.randn(hidden_size, hidden_size)
     o = parallel_model(i)
@@ -100,8 +76,6 @@ with torch.device(f"cuda:{LOCAL_RANK}"):
     # a = torch.compile(parallel_model, backend=backend)(i)
     a = thunder.jit(parallel_model, executors=(tmp_executor,))(i)
 
-    # print(o)
-    # print(a)
     print("TESTING EQUALITY")
     torch.testing.assert_close(o, a)
 
