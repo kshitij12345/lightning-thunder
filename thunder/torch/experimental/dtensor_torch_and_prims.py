@@ -185,6 +185,48 @@ pytorchex.register_implementation(dtensor_linear_prim, dtensor_linear_prim_impl)
 def dtensor_linear(a: TensorLike, w: TensorLike, bias: None | TensorLike = None) -> TensorLike:
     return dtensor_linear_prim(a, w, bias)
 
+from typing import Optional
+from torch.distributed.tensor import DTensor
+
+def dtensor_from_local_meta(x, mesh, placements, *, run_check: bool = False, shape: Optional[torch.Size] = None, stride: Optional[tuple[int, ...]] = None):
+    res = run_with_fake_tensor(DTensor.from_local, x, mesh, placements, run_check=run_check, shape=shape, stride=stride)
+    from thunder.torch.experimental.dtensor_proxy import proxify_dtensor
+    res = proxify_dtensor(res)
+    return res
+
+# def dtensor_from_local_fn(x, mesh, placements, *, run_check: bool = False, shape: Optional[torch.Size] = None, stride: Optional[tuple[int, ...]] = None):
+#     return DTensor.from_local(x, mesh, placements, run_check=run_check, shape=shape, stride=stride)
+
+dtensor_from_local_prim = make_prim("dtensor_from_local", "dtensor_from_local", meta=dtensor_from_local_meta)
+
+dtensor_from_local_prim_impl = pytorchex.register_operator("dtensor_from_local", like=dtensor_from_local_prim, fn=DTensor.from_local)
+
+pytorchex.register_implementation(dtensor_from_local_prim, dtensor_from_local_prim_impl)
+
+def dtensor_redistribute_meta(dtensor, device_mesh: "Optional[DeviceMesh]" = None, placements: "Optional[Sequence[Placement]]" = None, *, async_op: bool = False) -> "DTensor":
+    res = run_with_fake_tensor(DTensor.redistribute, dtensor, device_mesh, placements, async_op=async_op)
+    from thunder.torch.experimental.dtensor_proxy import proxify_dtensor
+    res = proxify_dtensor(res)
+    return res
+
+dtensor_redistribute_prim = make_prim("dtensor_redistribute", "dtensor_redistribute", meta=dtensor_redistribute_meta)
+
+dtensor_redistribute_prim_impl = pytorchex.register_operator("dtensor_redistribute", like=dtensor_redistribute_prim, fn=DTensor.redistribute)
+
+pytorchex.register_implementation(dtensor_redistribute_prim, dtensor_redistribute_prim_impl)
+
+def dtensor_to_local_meta(dtensor, *, grad_placements: "Optional[Sequence[Placement]]" = None):
+    res = run_with_fake_tensor(DTensor.to_local, dtensor, grad_placements=grad_placements)
+    from thunder.core.proxies import proxy
+    res = proxy(res)
+    return res
+
+dtensor_to_local_prim = make_prim("dtensor_to_local", "dtensor_to_local", meta=dtensor_to_local_meta)
+
+dtensor_to_local_prim_impl = pytorchex.register_operator("dtensor_to_local", like=dtensor_to_local_prim, fn=DTensor.to_local)
+
+pytorchex.register_implementation(dtensor_to_local_prim, dtensor_to_local_prim_impl)
+
 
 def register_dtensor_torch_and_prims():
     register_function_for_dtensor(torch.mul, ltorch.mul, dtensor_mul, is_method=True)
