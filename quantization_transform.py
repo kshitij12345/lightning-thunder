@@ -37,9 +37,30 @@ def _view_input_as_2d(x):
     return x.view((-1, shape[-1]))
 
 
-def quantize_fn(
-    t: torch.Tensor, no_per_tensor_scale: bool = False
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+# Using triton kernel
+# def quantize_fn(t: torch.Tensor, no_per_tensor_scale: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+#     with torch.no_grad():
+#         assert t.shape[1] % 16 == 0, (
+#                 f"Triton kernel requires K (dim 1) to be divisible by 16, got {data_hp.shape[1]}"
+#             )
+#         if no_per_tensor_scale:
+#             per_tensor_scale = None
+#         else:
+#             per_tensor_scale = compute_per_tensor_scale(t)
+        
+#         org_t = t
+#         if org_t.ndim == 3:
+#             org_shape = t.shape
+#             t = _view_input_as_2d(t)
+
+#         qs, qw = nvfp4_tensor.triton_quantize_nvfp4(t, per_tensor_scale)
+
+#         if org_t.ndim == 3:
+#             qw = qw.view(org_shape[:-1] + (-1,))
+#         return qw, qs, per_tensor_scale
+
+# Using nvfp4_tensor.nvfp4_quantize
+def quantize_fn(t: torch.Tensor, no_per_tensor_scale: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     with torch.no_grad():
         if no_per_tensor_scale:
             per_tensor_scale = None
@@ -115,8 +136,8 @@ def _nvfp4_linear(
         # scale_result=scale_result,  # Not supported yet
     )
     if inp_reshaped:
-        M, W = result.shape
-        result = result.view(B, M // B, W)
+        M, N = result.shape
+        result = result.view(B, M // B, N)
 
     if scale_result is not None:
         result = result * scale_result.to(out_dtype)
@@ -502,7 +523,11 @@ if __name__ == "__main__":
         for name, ref_param in ref_model.named_parameters():
             if isinstance(ref_param, nvfp4_tensor.NVFP4Tensor):
                 param = compiled_linear.get_parameter(name)
-                torch.testing.assert_close(param, ref_param._data)
+                if hasattr(ref_param, "qdata"):
+                    torch.testing.assert_close(param, ref_param.qdata)
+                else:
+                    torch.testing.assert_close(param, ref_param._data)
+
                 torch.testing.assert_close(compiled_linear.get_parameter(f"{name}.block_scales"), ref_param._scale_e4m3)
                 torch.testing.assert_close(
                     compiled_linear.get_parameter(f"{name}.per_tensor_scale"), ref_param._per_tensor_scale
