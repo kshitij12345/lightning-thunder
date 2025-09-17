@@ -38,29 +38,29 @@ def _view_input_as_2d(x):
 
 
 # Using triton kernel
-# def quantize_fn(t: torch.Tensor, no_per_tensor_scale: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-#     with torch.no_grad():
-#         assert t.shape[1] % 16 == 0, (
-#                 f"Triton kernel requires K (dim 1) to be divisible by 16, got {data_hp.shape[1]}"
-#             )
-#         if no_per_tensor_scale:
-#             per_tensor_scale = None
-#         else:
-#             per_tensor_scale = compute_per_tensor_scale(t)
-        
-#         org_t = t
-#         if org_t.ndim == 3:
-#             org_shape = t.shape
-#             t = _view_input_as_2d(t)
+def _triton_quant(
+    t: torch.Tensor, no_per_tensor_scale: bool = False
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    with torch.no_grad():
+        assert t.shape[1] % 16 == 0, f"Triton kernel requires K (dim 1) to be divisible by 16, got {data_hp.shape[1]}"
+        if no_per_tensor_scale:
+            per_tensor_scale = None
+        else:
+            per_tensor_scale = compute_per_tensor_scale(t)
 
-#         qs, qw = nvfp4_tensor.triton_quantize_nvfp4(t, per_tensor_scale)
+        org_t = t
+        if org_t.ndim == 3:
+            org_shape = t.shape
+            t = _view_input_as_2d(t)
+        qs, qw = nvfp4_tensor.triton_quantize_nvfp4(t, per_tensor_scale)
+        if org_t.ndim == 3:
+            qw = qw.view(org_shape[:-1] + (-1,))
+        return qw, qs, per_tensor_scale
 
-#         if org_t.ndim == 3:
-#             qw = qw.view(org_shape[:-1] + (-1,))
-#         return qw, qs, per_tensor_scale
 
-# Using nvfp4_tensor.nvfp4_quantize
-def quantize_fn(t: torch.Tensor, no_per_tensor_scale: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+def _python_quant(
+    t: torch.Tensor, no_per_tensor_scale: bool = False
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     with torch.no_grad():
         if no_per_tensor_scale:
             per_tensor_scale = None
@@ -79,6 +79,15 @@ def quantize_fn(t: torch.Tensor, no_per_tensor_scale: bool = False) -> tuple[tor
         qs = nvfp4_tensor.to_blocked(qs.view(scale_shape)).flatten()
 
     return qw, qs, per_tensor_scale
+
+
+def quantize_fn(
+    t: torch.Tensor, no_per_tensor_scale: bool = False, use_python: bool = False
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    if use_python:
+        return _python_quant(t, no_per_tensor_scale)
+    else:
+        return _triton_quant(t, no_per_tensor_scale)
 
 
 # https://github.com/pytorch/ao/blob/4dffb40280ea7b0e1732c580d08df58d0134c543/torchao/prototype/mx_formats/nvfp4_tensor.py#L567-L568
@@ -254,7 +263,7 @@ class QuantizedLinearTransform(thunder.Transform):
             weight_name = f"{name}.weight"
             w = tm.get_parameter(weight_name)
 
-            qw, qs, per_tensor_scale = quantize_fn(w, not self.use_per_tensor_scale)
+            qw, qs, per_tensor_scale = quantize_fn(w, not self.use_per_tensor_scale, use_python=True)
 
             tm._overrides_parameters[weight_name] = qw.to(w.device)
             if self.use_per_tensor_scale:
