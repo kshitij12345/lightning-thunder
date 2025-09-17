@@ -38,7 +38,7 @@ def _view_input_as_2d(x):
 
 
 # Using triton kernel
-# def quantize_fn(t: torch.Tensor, no_per_tensor_scale: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+# def quantize_fn(t: torch.Tensor, no_per_tensor_scale: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
 #     with torch.no_grad():
 #         assert t.shape[1] % 16 == 0, (
 #                 f"Triton kernel requires K (dim 1) to be divisible by 16, got {data_hp.shape[1]}"
@@ -60,7 +60,7 @@ def _view_input_as_2d(x):
 #         return qw, qs, per_tensor_scale
 
 # Using nvfp4_tensor.nvfp4_quantize
-def quantize_fn(t: torch.Tensor, no_per_tensor_scale: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def quantize_fn(t: torch.Tensor, no_per_tensor_scale: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     with torch.no_grad():
         if no_per_tensor_scale:
             per_tensor_scale = None
