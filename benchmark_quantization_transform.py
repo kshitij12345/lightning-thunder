@@ -14,10 +14,10 @@ from torchao.prototype.mx_formats.inference_workflow import (
 
 model_name = "Llama-3-8B"
 device = "cuda"
-N_LAYER = 10
+# N_LAYER = 10
 
 cfg: Config = Config.from_name(model_name)
-cfg.n_layer = N_LAYER
+# cfg.n_layer = N_LAYER
 
 with torch.device(device):
     model = GPT(cfg).to(torch.bfloat16)
@@ -29,15 +29,18 @@ def benchmark_model(model, inp, name):
         stmt="model(inp)",
         setup="",
         globals={"model": model, "inp": inp},
+        label="Llama-3-8B Input Shape (1, 2048)",
+        description=name,
     )
 
     measurement = timer.timeit(number=10)
     print(f"{name} Time taken: {measurement}")
+    return measurement
 
 
 inp = torch.randint(0, 255, (1, 2048,), device=device)
 
-benchmark_model(model, inp, "Eager")
+eager_measurement = benchmark_model(model, inp, "Eager")
 
 def quantization_filter(name, module):
     return isinstance(module, torch.nn.Linear)
@@ -48,7 +51,7 @@ executors = (nvfp4_executor,) + thunder.get_default_executors()
 
 compiled_model = thunder.jit(model, transforms=xforms, executors=executors)
 
-benchmark_model(compiled_model, inp, "Thunder")
+thunder_measurement = benchmark_model(compiled_model, inp, "Thunder")
 
 trcs = thunder.last_traces(compiled_model)
 trcs[-1].save_trace("quantized_trc.py")
@@ -61,8 +64,12 @@ config = NVFP4InferenceConfig(
 # This mutates the model
 quantize_(model, config=NVFP4InferenceConfig())
 
-benchmark_model(model, inp, "Torchao")
+torchao_measurement = benchmark_model(model, inp, "Torchao")
 
 cmodel = torch.compile(model)
 
-benchmark_model(cmodel, inp, "TorchCompile + AO")
+torchao_compile_measurement = benchmark_model(cmodel, inp, "TorchCompile + AO")
+
+compare = torch.utils.benchmark.Compare([eager_measurement, thunder_measurement,
+                                         torchao_measurement, torchao_compile_measurement])
+compare.print()
