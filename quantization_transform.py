@@ -465,7 +465,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=250916, help="seed value")
     parser.add_argument("--skip-trace", action="store_true", help="skip printing execution trace")
     parser.add_argument("--skip-test", action="store_true", help="skip numeric test against torchao")
-    parser.add_argument("--separate-quant", action="store_true", help="do quantization separately")
+    parser.add_argument("--no-separate-quant", action="store_true", help="do quantization separately")
     # TODO: check if this option is correctly applied to activation quantization in the future
     parser.add_argument("--per-tensor-scale", action="store_true", help="use per-tensor scale.")
     args = parser.parse_args()
@@ -479,7 +479,7 @@ if __name__ == "__main__":
         quantize_(ref_model, NVFP4InferenceConfig(use_triton_kernel=False))
 
     tfms = QuantizedLinearTransform(
-        separate_quantization=args.separate_quant,
+        separate_quantization=not args.no_separate_quant,
         use_per_tensor_scale=args.per_tensor_scale,
     )
     compiled_linear: thunder.ThunderModule = thunder.jit(
