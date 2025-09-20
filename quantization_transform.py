@@ -29,6 +29,7 @@ FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 
 def compute_per_tensor_scale(t: torch.Tensor) -> torch.Tensor:
+    assert False
     return ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / t.float().abs().amax()).to(torch.float32)
 
 
@@ -38,56 +39,54 @@ def _view_input_as_2d(x):
 
 
 # Using triton kernel
-def _triton_quant(
-    t: torch.Tensor, no_per_tensor_scale: bool = False
+def quantize_fn(
+    t: torch.Tensor, no_per_tensor_scale: bool = False, use_python = False
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    with torch.no_grad():
-        assert t.shape[1] % 16 == 0, f"Triton kernel requires K (dim 1) to be divisible by 16, got {data_hp.shape[1]}"
-        if no_per_tensor_scale:
-            per_tensor_scale = None
-        else:
-            per_tensor_scale = compute_per_tensor_scale(t)
+    # assert t.shape[1] % 16 == 0, f"Triton kernel requires K (dim 1) to be divisible by 16, got {t.shape[1]}"
+    if no_per_tensor_scale:
+        per_tensor_scale = None
+    else:
+        per_tensor_scale = compute_per_tensor_scale(t)
 
-        org_t = t
-        if org_t.ndim == 3:
-            org_shape = t.shape
-            t = _view_input_as_2d(t)
-        qs, qw = nvfp4_tensor.triton_quantize_nvfp4(t, per_tensor_scale)
-        if org_t.ndim == 3:
-            qw = qw.view(org_shape[:-1] + (-1,))
-        return qw, qs, per_tensor_scale
+    org_t = t
+    if org_t.ndim == 3:
+        org_shape = t.shape
+        t = _view_input_as_2d(t)
+    qs, qw = nvfp4_tensor.triton_quantize_nvfp4(t, per_tensor_scale)
+    if org_t.ndim == 3:
+        qw = qw.view(org_shape[:-1] + (-1,))
+    return qw, qs, per_tensor_scale
 
 
 def _python_quant(
     t: torch.Tensor, no_per_tensor_scale: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    with torch.no_grad():
-        if no_per_tensor_scale:
-            per_tensor_scale = None
-        else:
-            per_tensor_scale = compute_per_tensor_scale(t)
-        qs, qw = nvfp4_tensor.nvfp4_quantize(t, per_tensor_scale=per_tensor_scale)
+    if no_per_tensor_scale:
+        per_tensor_scale = None
+    else:
+        per_tensor_scale = compute_per_tensor_scale(t)
+    qs, qw = nvfp4_tensor.nvfp4_quantize(t, per_tensor_scale=per_tensor_scale)
 
-        if t.ndim == 2:
-            # Swizzle the scales
-            M, K = t.shape[0], t.shape[1]
-        else:
-            assert t.ndim == 3
-            M, K = _view_input_as_2d(t).shape
+    if t.ndim == 2:
+        # Swizzle the scales
+        M, K = t.shape[0], t.shape[1]
+    else:
+        assert t.ndim == 3
+        M, K = _view_input_as_2d(t).shape
 
-        scale_shape = (M, K // BLOCK_SIZE)
-        qs = nvfp4_tensor.to_blocked(qs.view(scale_shape)).flatten()
+    scale_shape = (M, K // BLOCK_SIZE)
+    qs = nvfp4_tensor.to_blocked(qs.view(scale_shape)).flatten()
 
     return qw, qs, per_tensor_scale
 
 
-def quantize_fn(
-    t: torch.Tensor, no_per_tensor_scale: bool = False, use_python: bool = False
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    if use_python:
-        return _python_quant(t, no_per_tensor_scale)
-    else:
-        return _triton_quant(t, no_per_tensor_scale)
+# def quantize_fn(
+#     t: torch.Tensor, no_per_tensor_scale: bool = False, use_python: bool = False
+# ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+#     if use_python:
+#         return _python_quant(t, no_per_tensor_scale)
+#     else:
+#         return _triton_quant(t, no_per_tensor_scale)
 
 
 # https://github.com/pytorch/ao/blob/4dffb40280ea7b0e1732c580d08df58d0134c543/torchao/prototype/mx_formats/nvfp4_tensor.py#L567-L568
@@ -103,32 +102,6 @@ def _nvfp4_linear(
 ) -> torch.Tensor:
     quantized_b = quantized_b.t()
 
-    # assert quantized_a.is_contiguous()
-    # assert quantized_b.t().is_contiguous()
-    # assert a._block_size == 16, f"NVFP4 requires block_size=16, got {a._block_size}"
-    # assert b._block_size == 16, f"NVFP4 requires block_size=16, got {b._block_size}"
-    # assert bias is None
-
-    # M, K = quantized_a.shape[0], quantized_a.shape[1]
-    # N = quantized_b.shape[1]
-
-    a_scale_blocked = a_block_scales  # Already swizzled
-    b_scale_blocked = b_block_scales  # Already swizzled
-
-    # Merge double quant scales into 1 scale for Scale_In^D
-    scale_result: torch.Tensor | None
-    if a_per_tensor_scale is not None and b_per_tensor_scale is not None:
-        scale_result = a_per_tensor_scale * b_per_tensor_scale
-    else:
-        scale_result = None
-
-    # THIS IS A WORKAROUND:
-    # RuntimeError: CUDA error: CUBLAS_STATUS_INVALID_VALUE when calling
-    # When we have per-tensor scaling, we need to apply it before bias
-    # since bias is not quantized
-    should_add_bias_separately = (scale_result is not None) and (bias is not None)
-    # should_add_bias_separately = bias is not None
-
     inp_reshaped = False
     if quantized_a.ndim == 3:
         B, _, _ = quantized_a.shape
@@ -138,22 +111,15 @@ def _nvfp4_linear(
     result = torch._scaled_mm(
         quantized_a.view(torch.float4_e2m1fn_x2),
         quantized_b.view(torch.float4_e2m1fn_x2),
-        a_scale_blocked.view(torch.float8_e4m3fn),
-        b_scale_blocked.view(torch.float8_e4m3fn),
-        bias=None if should_add_bias_separately else bias,
+        a_block_scales,
+        b_block_scales,
+        bias=None,
         out_dtype=out_dtype,
         # scale_result=scale_result,  # Not supported yet
     )
     if inp_reshaped:
         M, N = result.shape
         result = result.view(B, M // B, N)
-
-    if scale_result is not None:
-        result = result * scale_result.to(out_dtype)
-
-    # Add bias after scaling if needed
-    if should_add_bias_separately:
-        result = result + bias
 
     return result
 

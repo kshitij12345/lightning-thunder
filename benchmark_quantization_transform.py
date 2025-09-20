@@ -14,10 +14,10 @@ from torchao.prototype.mx_formats.inference_workflow import (
 
 model_name = "Llama-3-8B"
 device = "cuda"
-# N_LAYER = 10
+N_LAYER = 1
 
 cfg: Config = Config.from_name(model_name)
-# cfg.n_layer = N_LAYER
+cfg.n_layer = N_LAYER
 
 with torch.device(device):
     model = GPT(cfg).to(torch.bfloat16)
@@ -25,6 +25,13 @@ model.eval().requires_grad_(False)
 
 
 def benchmark_model(model, inp, name):
+    # Warm-up
+    # model(inp)
+    # torch.cuda.synchronize()
+
+    # torch.cuda.nvtx.range_push(name)
+    # model(inp)
+    # torch.cuda.nvtx.range_pop()
     timer = torch.utils.benchmark.Timer(
         stmt="model(inp)",
         setup="",
@@ -33,12 +40,28 @@ def benchmark_model(model, inp, name):
         description=name,
     )
 
-    measurement = timer.timeit(number=10)
+    measurement = timer.timeit(number=5)
     print(f"{name} Time taken: {measurement}")
+    print()
     return measurement
 
 
 inp = torch.randint(0, 255, (1, 2048,), device=device)
+
+# class Module(torch.nn.Module):
+#     def __init__(self, in_features: int = 64, out_features: int = 256, bias: bool = False):
+#         super().__init__()
+#         self.linear = torch.nn.Linear(in_features, out_features, bias=bias)
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         out = self.linear(x)
+#         return out
+
+# model = torch.nn.Linear(4096, 6144, device=device).to(torch.bfloat16)
+# model = Module(4096, 6144).to(torch.bfloat16).to("cuda")
+# model.requires_grad_(False)
+
+# inp = torch.randn(1, 2048, 4096, dtype=torch.bfloat16, device=device)
 
 eager_measurement = benchmark_model(model, inp, "Eager")
 
@@ -46,8 +69,11 @@ def quantization_filter(name, module):
     return isinstance(module, torch.nn.Linear)
     # return "mlp" in name and isinstance(module, torch.nn.Linear)
 
-xforms = [QuantizedLinearTransform(filter_fn=quantization_filter)]
-executors = (nvfp4_executor,) + thunder.get_default_executors()
+# xforms = [QuantizedLinearTransform(filter_fn=quantization_filter, separate_quantization=True)]
+# executors = (nvfp4_executor,) + thunder.get_default_executors()
+xforms = []
+executors = None
+# executors = () # None
 
 compiled_model = thunder.jit(model, transforms=xforms, executors=executors)
 
@@ -58,7 +84,7 @@ trcs[-1].save_trace("quantized_trc.py")
 
 mm_config = NVFP4MMConfig.DYNAMIC
 config = NVFP4InferenceConfig(
-        mm_config=mm_config, use_triton_kernel=False
+        mm_config=mm_config, use_triton_kernel=True
 )
 
 # This mutates the model
