@@ -39,8 +39,8 @@ def _view_input_as_2d(x):
 
 
 # Using triton kernel
-def quantize_fn(
-    t: torch.Tensor, no_per_tensor_scale: bool = False, use_python = False
+def _triton_quant(
+    t: torch.Tensor, no_per_tensor_scale: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     # assert t.shape[1] % 16 == 0, f"Triton kernel requires K (dim 1) to be divisible by 16, got {t.shape[1]}"
     if no_per_tensor_scale:
@@ -80,13 +80,13 @@ def _python_quant(
     return qw, qs, per_tensor_scale
 
 
-# def quantize_fn(
-#     t: torch.Tensor, no_per_tensor_scale: bool = False, use_python: bool = False
-# ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-#     if use_python:
-#         return _python_quant(t, no_per_tensor_scale)
-#     else:
-#         return _triton_quant(t, no_per_tensor_scale)
+def quantize_fn(
+    t: torch.Tensor, no_per_tensor_scale: bool = False, use_python: bool = False
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    if use_python:
+        return _python_quant(t, no_per_tensor_scale)
+    else:
+        return _triton_quant(t, no_per_tensor_scale)
 
 
 # https://github.com/pytorch/ao/blob/4dffb40280ea7b0e1732c580d08df58d0134c543/torchao/prototype/mx_formats/nvfp4_tensor.py#L567-L568
